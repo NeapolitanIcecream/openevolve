@@ -5,8 +5,8 @@ from typing import Optional
 
 import requests
 
-BASE_URL = os.environ.get("COMM_DEMO_BASE", "http://127.0.0.1:8000")
-API_TOKEN = os.environ.get("COMM_DEMO_TOKEN", "my-secret-token")
+BASE_URL = os.environ.get("COMM_DEMO_BASE", "https://evolve.voile.tech")
+API_TOKEN = os.environ.get("COMM_DEMO_TOKEN", "knowledge42")
 POLL_INTERVAL = float(os.environ.get("COMM_DEMO_POLL", 2))  # 秒
 
 HEADERS = {"Authorization": API_TOKEN}

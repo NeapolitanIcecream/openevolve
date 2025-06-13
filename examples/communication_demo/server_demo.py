@@ -80,10 +80,5 @@ async def fetch_result(job_id: str, authorization: str = Header(None)):
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("COMM_DEMO_PORT", 8000))
-    uvicorn.run(
-        "examples.communication_demo.server_demo:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-    ) 
+    port = int(os.environ.get("COMM_DEMO_PORT", 8042))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)

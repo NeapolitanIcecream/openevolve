@@ -26,7 +26,7 @@ pip install fastapi uvicorn requests
 额外，worker 端可设：
 | 变量             | 说明                  | 默认 |
 |------------------|-----------------------|------|
-| `COMM_DEMO_BASE` | 服务器地址            | http://127.0.0.1:8000 |
+| `COMM_DEMO_BASE` | 服务器地址            | http://127.0.0.1:8042 |
 | `COMM_DEMO_POLL` | 轮询间隔（秒）        | 2 |
 
 ## 步骤 1：在笔记本启动服务端
@@ -36,7 +36,7 @@ export COMM_DEMO_TOKEN="my-secret-token"
 python examples/communication_demo/server_demo.py
 ```
 
-若需要公网可达，可用 Cloudflare Tunnel / ngrok 等，将本地 `8000` 端口暴露并记住外部 URL，例如 `https://abc.tunnel.dev`。
+若需要公网可达，可用 Cloudflare Tunnel / ngrok 等，将本地 `8042` 端口暴露并记住外部 URL，例如 `https://abc.tunnel.dev`。
 
 ## 步骤 2：在内网服务器启动 worker
 
@@ -52,7 +52,7 @@ python examples/communication_demo/worker_demo.py
 在服务端再开一个终端（或用 Postman/curl）：
 
 ```bash
-curl -X POST http://127.0.0.1:8000/enqueue \
+curl -X POST http://127.0.0.1:8042/enqueue \
      -H "Authorization: my-secret-token" \
      -H "Content-Type: application/json" \
      -d '{"job_id":"42","payload":"hello world"}'
@@ -63,7 +63,7 @@ curl -X POST http://127.0.0.1:8000/enqueue \
 查询结果：
 
 ```bash
-curl http://127.0.0.1:8000/result/42 -H "Authorization: my-secret-token"
+curl http://127.0.0.1:8042/result/42 -H "Authorization: my-secret-token"
 ```
 
 输出：
