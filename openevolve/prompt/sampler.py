@@ -166,14 +166,14 @@ class PromptSampler:
         improvement_areas = []
 
         # Check program length
-        if len(current_program) > 500:
+        if len(current_program) > self.config.simplification_suggestion_line_threshold:
             improvement_areas.append(
                 "Consider simplifying the code to improve readability and maintainability"
             )
 
         # Check for performance patterns in previous attempts
-        if len(previous_programs) >= 2:
-            recent_attempts = previous_programs[-2:]
+        if len(previous_programs) >= self.config.regression_analysis_window_size:
+            recent_attempts = previous_programs[-self.config.regression_analysis_window_size :]
             metrics_improved = []
             metrics_regressed = []
 
@@ -233,7 +233,9 @@ class PromptSampler:
 
         # Format previous attempts (most recent first)
         previous_attempts_str = ""
-        selected_previous = previous_programs[-min(3, len(previous_programs)) :]
+        selected_previous = previous_programs[
+            -min(self.config.num_previous_attempts_in_prompt, len(previous_programs)) :
+        ]
 
         for i, program in enumerate(reversed(selected_previous)):
             attempt_number = len(previous_programs) - i
@@ -301,8 +303,10 @@ class PromptSampler:
         for i, program in enumerate(selected_top):
             # Extract a snippet (first 10 lines) for display
             program_code = program.get("code", "")
-            program_snippet = "\n".join(program_code.split("\n")[:10])
-            if len(program_code.split("\n")) > 10:
+            program_snippet = "\n".join(
+                program_code.split("\n")[: self.config.top_program_snippet_lines]
+            )
+            if len(program_code.split("\n")) > self.config.top_program_snippet_lines:
                 program_snippet += "\n# ... (truncated for brevity)"
 
             # Calculate a composite score using safe numeric average
@@ -354,8 +358,10 @@ class PromptSampler:
                 for i, program in enumerate(diverse_programs):
                     # Extract a snippet (first 5 lines for diversity)
                     program_code = program.get("code", "")
-                    program_snippet = "\n".join(program_code.split("\n")[:5])
-                    if len(program_code.split("\n")) > 5:
+                    program_snippet = "\n".join(
+                        program_code.split("\n")[: self.config.diverse_program_snippet_lines]
+                    )
+                    if len(program_code.split("\n")) > self.config.diverse_program_snippet_lines:
                         program_snippet += "\n# ... (truncated)"
 
                     # Calculate a composite score using safe numeric average
@@ -367,7 +373,7 @@ class PromptSampler:
                         key_features = [
                             f"Alternative approach to {name}"
                             for name in list(program.get("metrics", {}).keys())[
-                                :2
+                                : self.config.diverse_program_feature_metric_count
                             ]  # Just first 2 metrics
                         ]
 

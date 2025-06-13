@@ -120,6 +120,14 @@ class PromptConfig:
     num_top_programs: int = 3
     num_diverse_programs: int = 2
 
+    # Prompt content settings
+    simplification_suggestion_line_threshold: int = 500
+    regression_analysis_window_size: int = 2
+    num_previous_attempts_in_prompt: int = 3
+    top_program_snippet_lines: int = 10
+    diverse_program_snippet_lines: int = 5
+    diverse_program_feature_metric_count: int = 2
+
     # Template stochasticity
     use_template_stochasticity: bool = True
     template_variations: Dict[str, List[str]] = field(default_factory=dict)
@@ -286,6 +294,12 @@ class Config:
                 "evaluator_system_message": self.prompt.evaluator_system_message,
                 "num_top_programs": self.prompt.num_top_programs,
                 "num_diverse_programs": self.prompt.num_diverse_programs,
+                "simplification_suggestion_line_threshold": self.prompt.simplification_suggestion_line_threshold,
+                "regression_analysis_window_size": self.prompt.regression_analysis_window_size,
+                "num_previous_attempts_in_prompt": self.prompt.num_previous_attempts_in_prompt,
+                "top_program_snippet_lines": self.prompt.top_program_snippet_lines,
+                "diverse_program_snippet_lines": self.prompt.diverse_program_snippet_lines,
+                "diverse_program_feature_metric_count": self.prompt.diverse_program_feature_metric_count,
                 "use_template_stochasticity": self.prompt.use_template_stochasticity,
                 "template_variations": self.prompt.template_variations,
                 # Note: meta-prompting features not implemented

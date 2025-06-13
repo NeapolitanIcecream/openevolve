@@ -1,0 +1,46 @@
+max_iterations: 60
+checkpoint_interval: 5
+log_level: "INFO"
+
+# LLM configuration (示例占位，可根据实际 API 调整)
+llm:
+  primary_model: "llama3.1-8b"
+  primary_model_weight: 0.8
+  secondary_model: "llama-4-scout-17b-16e-instruct"
+  secondary_model_weight: 0.2
+  api_base: "https://api.cerebras.ai/v1"
+  timeout: 600
+  temperature: 0.7
+  top_p: 0.9
+  max_tokens: 4096
+
+# Prompt configuration
+prompt:
+  system_message: |
+    You are a compiler optimization expert. Your goal is to improve the code enclosed by the EVOLVE tags inside LLVM's LoopUnrollPass.cpp so that programs produced by the new clang compiler run faster on the PolyBench benchmark suite while keeping compilation time acceptable. Provide your changes as a diff patch and adhere to C++17 syntax.
+  num_top_programs: 3
+  use_template_stochasticity: true
+
+# Database / evolution 参数
+database:
+  population_size: 20
+  archive_size: 10
+  num_islands: 2
+  elite_selection_ratio: 0.2
+  exploitation_ratio: 0.7
+
+# Evaluator 参数
+# 需要较长的 timeout 以容纳 LLVM 构建 & PolyBench 运行
+# cascade_evaluation=true 将先跑迷你数据集筛选，再跑标准数据集精测
+# 可根据机器性能调整 parallel_evaluations
+
+evaluator:
+  timeout: 3600         # 1 小时
+  cascade_evaluation: true
+  cascade_thresholds: [0.95]
+  parallel_evaluations: 1
+  use_llm_feedback: false
+
+# Evolution 设置
+diff_based_evolution: true
+allow_full_rewrites: false 
