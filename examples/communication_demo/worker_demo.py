@@ -4,10 +4,22 @@ import uuid
 from typing import Optional
 
 import requests
+import urllib3
 
 BASE_URL = os.environ.get("COMM_DEMO_BASE", "https://evolve.voile.tech")
 API_TOKEN = os.environ.get("COMM_DEMO_TOKEN", "knowledge42")
 POLL_INTERVAL = float(os.environ.get("COMM_DEMO_POLL", 2))  # 秒
+
+# ------- TLS / CA 设置 -------
+# 如果处于自签名 CA 的内网 proxy 后面，可以通过环境变量 COMM_DEMO_CA_BUNDLE 指定 CA 证书路径；
+# 如果未设置，则默认关闭证书校验（不推荐，仅用于测试）。
+CA_BUNDLE = os.environ.get("COMM_DEMO_CA_BUNDLE")
+# verify=True | False | "/path/to/ca.pem"
+if CA_BUNDLE:
+    VERIFY = CA_BUNDLE  # 指定 CA bundle 路径
+else:
+    VERIFY = False      # 关闭校验
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {"Authorization": API_TOKEN}
 
@@ -18,7 +30,9 @@ def log(msg: str):
 def main():
     while True:
         try:
-            r = requests.get(f"{BASE_URL}/next", headers=HEADERS, timeout=10)
+            r = requests.get(
+                f"{BASE_URL}/next", headers=HEADERS, timeout=10, verify=VERIFY
+            )
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -44,6 +58,7 @@ def main():
                 headers=HEADERS,
                 json={"job_id": job_id, "output": output},
                 timeout=10,
+                verify=VERIFY,
             )
             res.raise_for_status()
             log(f"sent result for {job_id}: {output}")
