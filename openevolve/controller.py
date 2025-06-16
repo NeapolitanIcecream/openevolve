@@ -248,9 +248,12 @@ class OpenEvolve:
 
             # Generate code modification
             try:
-                llm_response = await self.llm_ensemble.generate_with_context(
-                    system_message=prompt["system"],
-                    messages=[{"role": "user", "content": prompt["user"]}],
+                # Pick a model from the ensemble so that we can record which one was used
+                model, model_name = self.llm_ensemble.sample_model_with_name()
+
+                llm_response = await model.generate_with_context(
+                    prompt["system"],
+                    [{"role": "user", "content": prompt["user"]}],
                 )
 
                 # Parse the response
@@ -301,6 +304,7 @@ class OpenEvolve:
                     metadata={
                         "changes": changes_summary,
                         "parent_metrics": parent.metrics,
+                        "llm_model": model_name,
                     },
                 )
 

@@ -100,8 +100,11 @@ def _rebuild_clang() -> float:
     return time.time() - start
 
 
-def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str) -> float:
-    """编译并运行单个 kernel，返回执行时间（秒）"""
+def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
+    """编译并运行单个 kernel。
+
+    返回 (compile_time_sec, exec_time_sec, bin_size_bytes)
+    """
     kernel_c = POLYBENCH_DIR / kernel_rel
     kernel_dir = kernel_c.parent
     exe_path = kernel_c.with_suffix(".exe")
@@ -129,31 +132,37 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str) -> fl
     # 运行并解析时间
     run = subprocess.run([str(exe_path)], capture_output=True, text=True, check=True)
     out = run.stdout + run.stderr
-    # PolyBench 默认打印 "kernel : TIME" 或纯数字，使用正则抓取最后一个浮点数
     m = re.findall(r"[0-9]+\.[0-9]+", out)
     exec_time = float(m[-1]) if m else 0.0
 
-    # 清理可执行文件，减小磁盘占用
+    bin_size = exe_path.stat().st_size
+
+    # 清理可执行文件
     exe_path.unlink(missing_ok=True)
-    return compile_time + exec_time  # 返回总耗时，可按需拆分
+
+    return compile_time, exec_time, bin_size
 
 
 def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
-    """公共评估逻辑"""
-
+    """公共评估逻辑，收集 PolyBench kernel 的编译时间、运行时间以及二进制体积。"""
     clang_bin = LLVM_BUILD_DIR / "bin" / "clang"
     if not clang_bin.exists():
         raise RuntimeError("clang binary 不存在，LLVM 构建可能失败")
 
-    total_time = 0.0
-    for k in kernels:
-        total_time += _compile_kernel(clang_bin, k, dataset_macro)
+    compile_total = 0.0
+    runtime_total = 0.0
+    bin_total = 0
 
-    # 以时间倒数作为性能分值
-    perf_score = 1.0 / (total_time + 1e-6)
+    for k in kernels:
+        c_time, r_time, b_size = _compile_kernel(clang_bin, k, dataset_macro)
+        compile_total += c_time
+        runtime_total += r_time
+        bin_total += b_size
+
     return {
-        "total_kernel_time_sec": total_time,
-        "perf_score": perf_score,
+        "compile_total_sec": compile_total,
+        "runtime_total_sec": runtime_total,
+        "bin_total_bytes": bin_total,
     }
 
 # ---------------- 公开的评估接口 ----------------
@@ -186,10 +195,23 @@ def _compute_and_cache_baseline():
     mini_metrics = _evaluate("MINI_DATASET", STAGE1_KERNELS)
     std_metrics = _evaluate("STANDARD_DATASET", STAGE2_KERNELS)
 
+    # 计算官方实现代码体积（字节）
+    loop_unroll_size_bytes = LOOP_UNROLL_CPP.with_suffix(".orig_bak").stat().st_size if LOOP_UNROLL_CPP.with_suffix(".orig_bak").exists() else LOOP_UNROLL_CPP.stat().st_size
+
     baseline_data = {
         "llvm_build_time_sec": baseline_build_time,
-        "mini_total_kernel_time_sec": mini_metrics["total_kernel_time_sec"],
-        "standard_total_kernel_time_sec": std_metrics["total_kernel_time_sec"],
+
+        # PolyBench kernel 运行时间
+        "mini_compile_total_sec": mini_metrics["compile_total_sec"],
+        "mini_runtime_total_sec": mini_metrics["runtime_total_sec"],
+        "mini_bin_total_bytes": mini_metrics["bin_total_bytes"],
+
+        "standard_compile_total_sec": std_metrics["compile_total_sec"],
+        "standard_runtime_total_sec": std_metrics["runtime_total_sec"],
+        "standard_bin_total_bytes": std_metrics["bin_total_bytes"],
+
+        # 源码大小
+        "loop_unroll_code_size_bytes": loop_unroll_size_bytes,
     }
 
     BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -199,45 +221,111 @@ def _compute_and_cache_baseline():
 
 
 def _load_baseline():
-    """加载基线数据，若不存在则计算"""
+    """加载基线数据，若不存在或字段缺失则重新计算"""
+
+    required_keys = {
+        "llvm_build_time_sec",
+        "loop_unroll_code_size_bytes",
+        "mini_compile_total_sec",
+        "mini_runtime_total_sec",
+        "mini_bin_total_bytes",
+        "standard_compile_total_sec",
+        "standard_runtime_total_sec",
+        "standard_bin_total_bytes",
+    }
+
     if not BASELINE_FILE.exists():
         _compute_and_cache_baseline()
 
     import json
     try:
-        return json.loads(BASELINE_FILE.read_text())
+        data = json.loads(BASELINE_FILE.read_text())
+        # 若缺关键字段则强制重算
+        if not required_keys.issubset(data.keys()):
+            raise ValueError("baseline fields outdated")
+        return data
     except Exception:
-        # 若读取失败，重新计算
+        # 若读取失败或字段缺失，重新计算
         _compute_and_cache_baseline()
         return json.loads(BASELINE_FILE.read_text())
 
 
 # ---------------- 重写后的评估接口 ----------------
 
+# -------------------------
+# 评分相关全局配置
+# -------------------------
+# 权重含义：
+#   runtime_speedup   —— 运行时间加速比（baseline_runtime / candidate_runtime）
+#   compile_speedup   —— PolyBench kernel 编译时间加速比（baseline_compile / candidate_compile）
+#   code_size_ratio   —— 二进制体积比（baseline_binsize / candidate_binsize）
+# 线性组合的形式为 Σ w_i * factor_i，默认仅考虑运行时间。
+SCORING_WEIGHTS = {
+    "runtime_speedup": 1.0,
+    "compile_speedup": 0.0,
+    "code_size_ratio": 0.0,
+}
+
+_EPS = 1e-9  # 防止除零
+
 def _evaluate_candidate(program_path: str, dataset_macro: str, kernels: List[str]):
-    """公共流程：写入候选 → 评估 → 计算归一化指标"""
+    """公共流程：写入候选 → 评估 → 计算归一化指标
+
+    评分因子：
+        - runtime_speedup   = baseline_runtime / candidate_runtime
+        - compile_speedup   = baseline_compile / candidate_compile
+        - code_size_ratio   = baseline_binsize / candidate_binsize
+
+    最终 fitness = Σ weight_i * factor_i
+    """
+
     _ensure_polybench_dir()
     baseline = _load_baseline()
 
     # 写入候选代码
     _write_candidate_to_llvm(program_path)
 
+    # ---------- 编译 LLVM
     _configure_llvm_once()
     build_time = _rebuild_clang()
+
+    # ---------- PolyBench 测试
     cand_metrics = _evaluate(dataset_macro, kernels)
 
-    # 归一化
+    # ---------- 计算各因子 ----------
     if dataset_macro == "MINI_DATASET":
-        base_total = baseline["mini_total_kernel_time_sec"]
+        baseline_runtime = baseline.get("mini_runtime_total_sec", baseline["mini_runtime_total_sec"])
     else:
-        base_total = baseline["standard_total_kernel_time_sec"]
+        baseline_runtime = baseline.get("standard_runtime_total_sec", baseline["standard_runtime_total_sec"])
 
-    speedup = base_total / cand_metrics["total_kernel_time_sec"] if cand_metrics["total_kernel_time_sec"] else 0.0
+    runtime_speedup = baseline_runtime / (cand_metrics["runtime_total_sec"] + _EPS)
 
-    # 仅使用 benchmark speedup 作为最终评分
-    fitness = speedup
+    # 编译时间加速比（PolyBench kernel 编译时间）
+    if dataset_macro == "MINI_DATASET":
+        baseline_compile = baseline["mini_compile_total_sec"]
+        baseline_binsize = baseline["mini_bin_total_bytes"]
+    else:
+        baseline_compile = baseline["standard_compile_total_sec"]
+        baseline_binsize = baseline["standard_bin_total_bytes"]
 
-    return {"fitness": fitness}
+    compile_speedup = baseline_compile / (cand_metrics["compile_total_sec"] + _EPS)
+
+    # 二进制体积比
+    code_size_ratio = baseline_binsize / (cand_metrics["bin_total_bytes"] + _EPS)
+
+    # ---------- 线性组合 ----------
+    fitness = (
+        SCORING_WEIGHTS["runtime_speedup"] * runtime_speedup
+        + SCORING_WEIGHTS["compile_speedup"] * compile_speedup
+        + SCORING_WEIGHTS["code_size_ratio"] * code_size_ratio
+    )
+
+    return {
+        "fitness": fitness,
+        "runtime_speedup": runtime_speedup,
+        "compile_speedup": compile_speedup,
+        "code_size_ratio": code_size_ratio,
+    }
 
 
 def evaluate_stage1(program_path: str):

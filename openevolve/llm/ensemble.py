@@ -71,3 +71,17 @@ class LLMEnsemble:
         for model in self.models:
             responses.append(await model.generate_with_context(system_message, messages, **kwargs))
         return responses
+
+    def sample_model_with_name(self) -> Tuple["LLMInterface", str]:
+        """Randomly sample a model based on weights and return (model, name)."""
+        if not self.models:
+            raise ValueError("LLMEnsemble has no models configured")
+
+        index = random.choices(range(len(self.models)), weights=self.weights, k=1)[0]
+
+        model = self.models[index]
+
+        # Fallback to index-based name if not provided
+        model_name = self.models_cfg[index].name or f"model_{index}"
+
+        return model, model_name

@@ -4,11 +4,11 @@ log_level: "INFO"
 
 # LLM configuration (示例占位，可根据实际 API 调整)
 llm:
-  primary_model: "llama3.1-8b"
+  primary_model: "official/deepseek-v3"
   primary_model_weight: 0.8
-  secondary_model: "llama-4-scout-17b-16e-instruct"
+  secondary_model: "deepseek/deepseek-r1"
   secondary_model_weight: 0.2
-  api_base: "https://api.cerebras.ai/v1"
+  # api_base: "https://api.cerebras.ai/v1"
   timeout: 600
   temperature: 0.7
   top_p: 0.9

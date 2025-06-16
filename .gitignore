@@ -55,3 +55,4 @@ secrets.yaml
 problems
 
 uv.lock
+secret.sh

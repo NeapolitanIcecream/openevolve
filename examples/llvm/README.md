@@ -49,12 +49,12 @@ python ../../openevolve-run.py LoopUnrollPass.cpp evaluator.py --config config.y
 2. **增量构建**：调用 Ninja 仅重新编译受影响的对象并重链 `clang`。
 3. **两阶段 PolyBench**
    1. **Stage-1（MINI_DATASET）**：快速测试 5 个代表性 kernel，用于粗筛。
-   2. **Stage-2（STANDARD_DATASET）**：对全部 kernel 精测，计算总耗时。
-4. **适应度计算**：
+   2. **Stage-2（STANDARD_DATASET）**：对全部 kernel 精测。
+4. **评分**：基于官方实现（baseline）的归一化指标，默认仅使用运行时间加速比  
    ```text
-   fitness = 1 / total_kernel_time_sec ÷ (1 + llvm_build_time_sec / 60)
+   fitness = Σ w_i × factor_i     (w_i 来源于 SCORING_WEIGHTS)
    ```
-   越大越好。
+   其中 `runtime_speedup = baseline_runtime / candidate_runtime`，其它因子（编译时间、二进制体积）同理。
 
 在 `config.yaml` 中启用了 `cascade_evaluation`，使 Stage-1 阈值达标的候选才进入 Stage-2，从而节约总时长。
 
@@ -72,7 +72,7 @@ python ../../openevolve-run.py LoopUnrollPass.cpp evaluator.py --config config.y
 
 - **Kernel 选择**：编辑 `evaluator.py` 中 `STAGE1_KERNELS`、`STAGE2_KERNELS` 列表即可。
 - **数据集规模**：将 `MINI_DATASET`、`STANDARD_DATASET` 替换为 `SMALL_DATASET` 等宏。
-- **Fitness 公式**：可在 `evaluator.py` 里调整对编译时间的惩罚权重。
+- **Fitness 公式**：可在 `evaluator.py` 中修改 `SCORING_WEIGHTS` 调整各因子权重。
 - **并行评估**：配置 `parallel_evaluations > 1` 以并行，但需保证硬件资源充足且 LLVM 构建目录相互隔离（默认共用 BuildDir，不建议并行构建）。
 
 祝你玩得开心，发掘出让编译器更快的魔法改动！ 
