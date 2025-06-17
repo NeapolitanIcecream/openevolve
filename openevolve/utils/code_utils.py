@@ -3,7 +3,7 @@ Utilities for code parsing, diffing, and manipulation
 """
 
 import re
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Set
 
 
 def parse_evolve_blocks(code: str) -> List[Tuple[int, int, str]]:
@@ -146,38 +146,44 @@ def format_diff_summary(diff_blocks: List[Tuple[str, str]]) -> str:
 
 def calculate_edit_distance(code1: str, code2: str) -> int:
     """
-    Calculate the Levenshtein edit distance between two code snippets
+    Approximate edit distance between two code snippets using a fast token-level
+    Jaccard distance instead of the expensive O(N²) Levenshtein algorithm.
+
+    This implementation dramatically reduces runtime for large files (e.g. >10 kB)
+    while still providing a reasonable diversity signal for the evolutionary
+    algorithm.
 
     Args:
         code1: First code snippet
         code2: Second code snippet
 
     Returns:
-        Edit distance (number of operations needed to transform code1 into code2)
+        An integer score ≥ 0 where larger values mean more dissimilar code.
     """
+
+    # Quick exit for identical strings
     if code1 == code2:
         return 0
 
-    # Simple implementation of Levenshtein distance
-    m, n = len(code1), len(code2)
-    dp = [[0 for _ in range(n + 1)] for _ in range(m + 1)]
+    # Tokenise by splitting on non-alphanumeric characters. This is fast and
+    # memory-efficient because it avoids building huge dynamic-programming
+    # tables.
+    tokens1: Set[str] = set(re.findall(r"[A-Za-z0-9_]+", code1))
+    tokens2: Set[str] = set(re.findall(r"[A-Za-z0-9_]+", code2))
 
-    for i in range(m + 1):
-        dp[i][0] = i
+    if not tokens1 and not tokens2:
+        return 0
 
-    for j in range(n + 1):
-        dp[0][j] = j
+    intersection = tokens1.intersection(tokens2)
+    union = tokens1.union(tokens2)
 
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            cost = 0 if code1[i - 1] == code2[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,  # deletion
-                dp[i][j - 1] + 1,  # insertion
-                dp[i - 1][j - 1] + cost,  # substitution
-            )
+    # Jaccard distance in [0, 1]
+    jaccard_distance = 1.0 - len(intersection) / len(union)
 
-    return dp[m][n]
+    # Scale to an integer similar to edit distance magnitude. We use the average
+    # token count as the reference length.
+    avg_len = (len(tokens1) + len(tokens2)) / 2
+    return int(jaccard_distance * avg_len * 2)  # *2 to keep numbers comparable
 
 
 def extract_code_language(code: str) -> str:

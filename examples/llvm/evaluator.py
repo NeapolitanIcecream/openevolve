@@ -3,8 +3,10 @@ import re
 import shutil
 import subprocess
 import time
+import platform
+import difflib  # 新增：用于生成 diff
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # -------------------------
 # 用户可通过环境变量覆盖以下路径
@@ -19,8 +21,8 @@ LOOP_UNROLL_CPP = LLVM_SRC_DIR / "llvm" / "lib" / "Transforms" / "Scalar" / "Loo
 # 评估用到的 PolyBench kernel 列表（相对 POLYBENCH_DIR）
 # Stage-1 用更少的 kernel，加速筛选；Stage-2 用全量 30 个 kernel
 STAGE1_KERNELS = [
-    "linear-algebra/kernels/gemm/gemm.c",
-    "linear-algebra/kernels/gesummv/gesummv.c",
+    "linear-algebra/blas/gemm/gemm.c",
+    "linear-algebra/blas/gesummv/gesummv.c",
     "stencils/jacobi-2d/jacobi-2d.c",
     "datamining/correlation/correlation.c",
     "medley/floyd-warshall/floyd-warshall.c",
@@ -36,10 +38,19 @@ else:
     STAGE2_KERNELS = STAGE1_KERNELS + [
         "linear-algebra/kernels/2mm/2mm.c",
         "linear-algebra/kernels/3mm/3mm.c",
-        "linear-algebra/kernels/syr2k/syr2k.c",
+        "linear-algebra/blas/syr2k/syr2k.c",
         "stencils/adi/adi.c",
         "stencils/fdtd-2d/fdtd-2d.c",
     ]
+
+# ---------- 调试辅助 ----------
+_DEBUG = os.environ.get("LLVM_EVAL_DEBUG", "0") == "1"
+
+
+def _log(msg: str):
+    """仅在环境变量 LLVM_EVAL_DEBUG=1 时打印调试信息"""
+    if _DEBUG:
+        print(f"[LLVM-Evaluator] {msg}", flush=True)
 
 # ---------- 工具函数 ----------
 
@@ -57,6 +68,51 @@ def _write_candidate_to_llvm(src_path: str):
     """读取候选代码，清理标记后写入官方 LoopUnrollPass.cpp"""
     candidate_code = Path(src_path).read_text()
     cleaned_code = _strip_evolve_markers(candidate_code)
+
+    # ---------- 生成 diff 统计（仅在调试模式） ----------
+    if _DEBUG:
+        try:
+            original_code = LOOP_UNROLL_CPP.read_text()
+            original_lines = original_code.splitlines()
+            candidate_lines = cleaned_code.splitlines()
+
+            diff_lines = list(
+                difflib.unified_diff(
+                    original_lines,
+                    candidate_lines,
+                    fromfile="original",
+                    tofile="candidate",
+                    n=3,
+                )
+            )
+
+            # 统计变更行（忽略 diff 头部 @@ 行）
+            changed_count = sum(
+                1
+                for ln in diff_lines
+                if ln.startswith("+") or ln.startswith("-") and not ln.startswith("@@")
+            )
+
+            _log(
+                "候选代码行数: {}；原始代码行数: {}；diff 变更行数: {}".format(
+                    len(candidate_lines), len(original_lines), changed_count
+                )
+            )
+
+            # 若差异过大（例如与原文件行数相当），提示可能是全文件替换
+            if changed_count > 0.8 * len(original_lines):
+                _log("⚠️ 检测到大规模变更，候选可能为全文件替换！")
+
+            # 仅打印前若干行 diff 作为预览，避免日志过长
+            preview_cnt = 30
+            if diff_lines:
+                _log(
+                    "Diff 预览（前 {} 行）:\n{}".format(
+                        preview_cnt, "\n".join(diff_lines[:preview_cnt])
+                    )
+                )
+        except Exception as diff_exc:
+            _log(f"生成 diff 统计失败: {diff_exc}")
 
     # 备份一次原始文件（首次运行时）
     backup_path = LOOP_UNROLL_CPP.with_suffix(".orig_bak")
@@ -88,16 +144,24 @@ def _configure_llvm_once():
         "-DLLVM_ENABLE_PROJECTS=clang",
         f"-DLLVM_TARGETS_TO_BUILD={native_arch}",
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DLLVM_ENABLE_ASSERTIONS=OFF",
+        "-DLLVM_INCLUDE_TESTS=OFF",
+        "-DLLVM_INCLUDE_EXAMPLES=OFF",
+        "-DLLVM_INCLUDE_BENCHMARKS=OFF",
+        "-DLLVM_INCLUDE_DOCS=OFF",
         str(LLVM_SRC_DIR),
     ]
-    subprocess.run(cmake_cmd, cwd=LLVM_BUILD_DIR, check=True)
+    _run_subprocess(cmake_cmd, cwd=LLVM_BUILD_DIR)
 
 
 def _rebuild_clang() -> float:
     """增量构建 clang，返回耗时秒"""
+    _log("开始增量构建 clang（ninja clang）…")
     start = time.time()
-    subprocess.run(["ninja", "clang"], cwd=LLVM_BUILD_DIR, check=True, stdout=subprocess.DEVNULL)
-    return time.time() - start
+    _run_subprocess(["ninja", "clang"], cwd=LLVM_BUILD_DIR)
+    duration = time.time() - start
+    _log(f"clang 构建完成，用时 {duration:.2f}s")
+    return duration
 
 
 def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
@@ -105,19 +169,49 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
 
     返回 (compile_time_sec, exec_time_sec, bin_size_bytes)
     """
+    _log(f"\n==== 开始处理 kernel: {kernel_rel} (数据集: {dataset_macro}) ====")
     kernel_c = POLYBENCH_DIR / kernel_rel
     kernel_dir = kernel_c.parent
     exe_path = kernel_c.with_suffix(".exe")
 
-    compile_cmd = [
-        str(clang_path),
+    # ----------------------
+    # 构建编译命令
+    # ----------------------
+    compile_cmd: List[str] = [str(clang_path)]
+
+    # 编译优化与数据集
+    compile_cmd += [
         "-O3",
+        "-std=c99",  # PolyBench 大多使用 C99 语法
         "-DPOLYBENCH_TIME",
         f"-D{dataset_macro}",
+    ]
+
+    # macOS 下，刚编译出的 clang 位于构建目录，尚未安装到系统路径。
+    # 若直接调用，往往找不到系统头文件（如 stdio.h）。
+    # 这里通过 xcrun 查询 SDK 路径并显式指定 sysroot，确保可以找到系统头文件。
+    if platform.system() == "Darwin":
+        try:
+            sdk_path = subprocess.check_output(
+                ["xcrun", "--sdk", "macosx", "--show-sdk-path"],
+                text=True,
+            ).strip()
+            if sdk_path:
+                compile_cmd += ["-isysroot", sdk_path]
+        except Exception:
+            # 若 xcrun 不可用，则继续，期待 Clang 自行找到头文件
+            pass
+
+    # PolyBench 及 kernel 的头文件搜索路径
+    compile_cmd += [
         "-I",
         str(POLYBENCH_DIR / "utilities"),
         "-I",
         str(kernel_dir),
+    ]
+
+    # 源文件以及输出
+    compile_cmd += [
         str(POLYBENCH_DIR / "utilities" / "polybench.c"),
         str(kernel_c),
         "-o",
@@ -125,17 +219,23 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
     ]
 
     # 编译
+    if _DEBUG:
+        _log("编译命令: " + " ".join(compile_cmd))
     start_compile = time.time()
-    subprocess.run(compile_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _run_subprocess(compile_cmd)
     compile_time = time.time() - start_compile
+    _log(f"编译完成，用时 {compile_time:.2f}s")
 
-    # 运行并解析时间
-    run = subprocess.run([str(exe_path)], capture_output=True, text=True, check=True)
-    out = run.stdout + run.stderr
+    # 运行可执行文件
+    _log("开始执行生成的可执行文件…")
+    run_result = subprocess.run([str(exe_path)], capture_output=True, text=True, check=True)
+    out = run_result.stdout + run_result.stderr
     m = re.findall(r"[0-9]+\.[0-9]+", out)
     exec_time = float(m[-1]) if m else 0.0
+    _log(f"执行完毕，用时 {exec_time:.2f}s")
 
     bin_size = exe_path.stat().st_size
+    _log(f"二进制体积: {bin_size} 字节")
 
     # 清理可执行文件
     exe_path.unlink(missing_ok=True)
@@ -145,6 +245,7 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
 
 def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
     """公共评估逻辑，收集 PolyBench kernel 的编译时间、运行时间以及二进制体积。"""
+    _log(f"开始评估数据集 {dataset_macro}，共 {len(kernels)} 个 kernels…")
     clang_bin = LLVM_BUILD_DIR / "bin" / "clang"
     if not clang_bin.exists():
         raise RuntimeError("clang binary 不存在，LLVM 构建可能失败")
@@ -158,6 +259,10 @@ def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
         compile_total += c_time
         runtime_total += r_time
         bin_total += b_size
+    _log(
+        f"数据集 {dataset_macro} 完成：总编译时间 {compile_total:.2f}s，"
+        f"总运行时间 {runtime_total:.2f}s，累积二进制体积 {bin_total} 字节"
+    )
 
     return {
         "compile_total_sec": compile_total,
@@ -167,88 +272,12 @@ def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
 
 # ---------------- 公开的评估接口 ----------------
 
-BASELINE_FILE = LLVM_BUILD_DIR / "baseline_metrics.json"
+# 仅在内存缓存基线
+_BASELINE_CACHE: Dict[str, float] = {}
 
-
-def _compute_and_cache_baseline():
-    """计算官方 LoopUnrollPass 的基线性能，结果写入 BASELINE_FILE"""
-    if BASELINE_FILE.exists():
-        return  # 已有缓存
-
-    print("[LLVM-Evaluator] Computing baseline metrics (first run)...")
-    # 确保 PolyBench 与构建目录
-    _ensure_polybench_dir()
-    _configure_llvm_once()
-
-    # 还原官方实现（若已被覆盖）
-    backup_path = LOOP_UNROLL_CPP.with_suffix(".orig_bak")
-    if backup_path.exists():
-        shutil.copy2(backup_path, LOOP_UNROLL_CPP)
-    else:
-        # 第一次备份
-        shutil.copy2(LOOP_UNROLL_CPP, backup_path)
-
-    # 重新构建 clang（完整构建或增量）
-    baseline_build_time = _rebuild_clang()
-
-    # 运行 MINI 与 STANDARD 数据集
-    mini_metrics = _evaluate("MINI_DATASET", STAGE1_KERNELS)
-    std_metrics = _evaluate("STANDARD_DATASET", STAGE2_KERNELS)
-
-    # 计算官方实现代码体积（字节）
-    loop_unroll_size_bytes = LOOP_UNROLL_CPP.with_suffix(".orig_bak").stat().st_size if LOOP_UNROLL_CPP.with_suffix(".orig_bak").exists() else LOOP_UNROLL_CPP.stat().st_size
-
-    baseline_data = {
-        "llvm_build_time_sec": baseline_build_time,
-
-        # PolyBench kernel 运行时间
-        "mini_compile_total_sec": mini_metrics["compile_total_sec"],
-        "mini_runtime_total_sec": mini_metrics["runtime_total_sec"],
-        "mini_bin_total_bytes": mini_metrics["bin_total_bytes"],
-
-        "standard_compile_total_sec": std_metrics["compile_total_sec"],
-        "standard_runtime_total_sec": std_metrics["runtime_total_sec"],
-        "standard_bin_total_bytes": std_metrics["bin_total_bytes"],
-
-        # 源码大小
-        "loop_unroll_code_size_bytes": loop_unroll_size_bytes,
-    }
-
-    BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    import json
-    BASELINE_FILE.write_text(json.dumps(baseline_data))
-
-
-
-def _load_baseline():
-    """加载基线数据，若不存在或字段缺失则重新计算"""
-
-    required_keys = {
-        "llvm_build_time_sec",
-        "loop_unroll_code_size_bytes",
-        "mini_compile_total_sec",
-        "mini_runtime_total_sec",
-        "mini_bin_total_bytes",
-        "standard_compile_total_sec",
-        "standard_runtime_total_sec",
-        "standard_bin_total_bytes",
-    }
-
-    if not BASELINE_FILE.exists():
-        _compute_and_cache_baseline()
-
-    import json
-    try:
-        data = json.loads(BASELINE_FILE.read_text())
-        # 若缺关键字段则强制重算
-        if not required_keys.issubset(data.keys()):
-            raise ValueError("baseline fields outdated")
-        return data
-    except Exception:
-        # 若读取失败或字段缺失，重新计算
-        _compute_and_cache_baseline()
-        return json.loads(BASELINE_FILE.read_text())
-
+# 返回当前进程基线缓存（若为空则说明尚未初始化）
+def _load_baseline() -> Dict[str, float]:
+    return _BASELINE_CACHE
 
 # ---------------- 重写后的评估接口 ----------------
 
@@ -292,25 +321,49 @@ def _evaluate_candidate(program_path: str, dataset_macro: str, kernels: List[str
     # ---------- PolyBench 测试
     cand_metrics = _evaluate(dataset_macro, kernels)
 
-    # ---------- 计算各因子 ----------
-    if dataset_macro == "MINI_DATASET":
-        baseline_runtime = baseline.get("mini_runtime_total_sec", baseline["mini_runtime_total_sec"])
-    else:
-        baseline_runtime = baseline.get("standard_runtime_total_sec", baseline["standard_runtime_total_sec"])
+    # ---------- 计算各因子与动态更新基线 ----------
+    prefix = "mini" if dataset_macro == "MINI_DATASET" else "standard"
+
+    runtime_key = f"{prefix}_runtime_total_sec"
+    compile_key = f"{prefix}_compile_total_sec"
+    bin_key = f"{prefix}_bin_total_bytes"
+
+    # 若当前基线缺失相应字段，则将候选结果写入内存基线
+    updated_baseline = False
+    if runtime_key not in baseline:
+        baseline[runtime_key] = cand_metrics["runtime_total_sec"]
+        updated_baseline = True
+    if compile_key not in baseline:
+        baseline[compile_key] = cand_metrics["compile_total_sec"]
+        updated_baseline = True
+    if bin_key not in baseline:
+        baseline[bin_key] = cand_metrics["bin_total_bytes"]
+        updated_baseline = True
+
+    # 其他可能缺失的通用字段
+    if "llvm_build_time_sec" not in baseline:
+        baseline["llvm_build_time_sec"] = build_time
+        updated_baseline = True
+
+    if "loop_unroll_code_size_bytes" not in baseline:
+        try:
+            baseline["loop_unroll_code_size_bytes"] = Path(program_path).stat().st_size
+            updated_baseline = True
+        except Exception:
+            pass
+
+    if updated_baseline:
+        # 更新全局缓存
+        global _BASELINE_CACHE
+        _BASELINE_CACHE = baseline
+
+    # 使用（可能已更新的）基线值计算评分因子
+    baseline_runtime = baseline.get(runtime_key, cand_metrics["runtime_total_sec"])
+    baseline_compile = baseline.get(compile_key, cand_metrics["compile_total_sec"])
+    baseline_binsize = baseline.get(bin_key, cand_metrics["bin_total_bytes"])
 
     runtime_speedup = baseline_runtime / (cand_metrics["runtime_total_sec"] + _EPS)
-
-    # 编译时间加速比（PolyBench kernel 编译时间）
-    if dataset_macro == "MINI_DATASET":
-        baseline_compile = baseline["mini_compile_total_sec"]
-        baseline_binsize = baseline["mini_bin_total_bytes"]
-    else:
-        baseline_compile = baseline["standard_compile_total_sec"]
-        baseline_binsize = baseline["standard_bin_total_bytes"]
-
     compile_speedup = baseline_compile / (cand_metrics["compile_total_sec"] + _EPS)
-
-    # 二进制体积比
     code_size_ratio = baseline_binsize / (cand_metrics["bin_total_bytes"] + _EPS)
 
     # ---------- 线性组合 ----------
@@ -328,24 +381,55 @@ def _evaluate_candidate(program_path: str, dataset_macro: str, kernels: List[str
     }
 
 
+def _exception_details(e: Exception):
+    import traceback
+    tb = traceback.format_exc()
+    return {
+        "error": str(e),
+        "traceback": tb,
+    }
+
+
+def _restore_original_llvm_file():
+    """将 LoopUnrollPass.cpp 恢复为最初的备份版本（若存在）。
+
+    该函数在评估流程结束后调用，确保不会因为候选代码覆盖而导致后续构建/使用出现异常。"""
+    backup_path = LOOP_UNROLL_CPP.with_suffix(".orig_bak")
+    if backup_path.exists():
+        try:
+            shutil.copy2(backup_path, LOOP_UNROLL_CPP)
+            _log("已恢复原始 LoopUnrollPass.cpp 文件")
+        except Exception as e:
+            # 出现异常时仅记录，而不终止主流程
+            _log(f"恢复原始 LoopUnrollPass.cpp 失败：{e}")
+    else:
+        # 当尚未创建备份时，说明尚未写入过候选代码，忽略即可
+        pass
+
+
 def evaluate_stage1(program_path: str):
     try:
         return _evaluate_candidate(program_path, "MINI_DATASET", STAGE1_KERNELS)
-    except Exception:
-        return {"error": 0.0}
+    except Exception as e:
+        return _exception_details(e)
+    finally:
+        # 无论成功或失败，都尝试恢复原始文件
+        _restore_original_llvm_file()
 
 
 def evaluate_stage2(program_path: str):
     try:
         return _evaluate_candidate(program_path, "STANDARD_DATASET", STAGE2_KERNELS)
-    except Exception:
-        return {"error": 0.0}
+    except Exception as e:
+        return _exception_details(e)
+    finally:
+        _restore_original_llvm_file()
 
 
 # 保持 evaluate 与 stage2 等价，方便直接调用
 
 def evaluate(program_path: str):
-    return evaluate_stage2(program_path)
+    return evaluate_stage1(program_path)
 
 # ---------------- PolyBench 准备 ----------------
 
@@ -357,7 +441,7 @@ def _ensure_polybench_dir():
     print(f"PolyBench not found at {POLYBENCH_DIR}, cloning...")
     POLYBENCH_DIR.parent.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
+        _run_subprocess(
             [
                 "git",
                 "clone",
@@ -365,8 +449,48 @@ def _ensure_polybench_dir():
                 "1",
                 "https://github.com/MatthiasJReisinger/PolyBenchC-4.2.1",
                 str(POLYBENCH_DIR),
-            ],
-            check=True,
+            ]
         )
     except Exception as e:
-        raise RuntimeError(f"Failed to clone PolyBench: {e}") 
+        raise RuntimeError(f"Failed to clone PolyBench: {e}")
+
+# ---------- 子进程执行辅助 ----------
+
+def _run_subprocess(cmd: List[str], cwd: Optional[Path] = None, silent: bool = True):
+    """执行子进程命令并在失败时提供详尽的错误日志。
+
+    参数：
+        cmd    —— 要执行的命令列表
+        cwd    —— 工作目录，可选
+        silent —— 是否隐藏 stdout/stderr；若环境变量 LLVM_EVAL_DEBUG=1 则自动关闭 silent
+    """
+
+    _log("运行子进程命令: " + " ".join(cmd))
+
+    # 若显式开启调试，则不隐藏输出
+    if os.environ.get("LLVM_EVAL_DEBUG", "0") == "1":
+        silent = False
+
+    try:
+        if silent:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        else:
+            result = subprocess.run(cmd, cwd=cwd, check=True)
+        return result
+    except subprocess.CalledProcessError as e:
+        # 拼接更友好的错误信息
+        err_lines = [
+            f"[LLVM-Evaluator] Command failed: {' '.join(cmd)}",
+            f"Return code: {e.returncode}",
+        ]
+        if hasattr(e, "stdout") and e.stdout:
+            err_lines.append("stdout:\n" + e.stdout)
+        if hasattr(e, "stderr") and e.stderr:
+            err_lines.append("stderr:\n" + e.stderr)
+        raise RuntimeError("\n".join(err_lines)) from e 
