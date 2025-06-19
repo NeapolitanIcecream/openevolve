@@ -40,16 +40,16 @@ prompt:
     If any of the above constraints are violated the submission will receive a score of zero.
 
     Always adhere to C++17 syntax.
-  num_top_programs: 3
+  num_top_programs: 4
   use_template_stochasticity: true
 
 # Database / evolution 参数
 database:
-  population_size: 20
-  archive_size: 10
-  num_islands: 2
-  elite_selection_ratio: 0.2
-  exploitation_ratio: 0.7
+  population_size: 40
+  archive_size: 20
+  num_islands: 4
+  elite_selection_ratio: 0.25
+  exploitation_ratio: 0.6
 
 # Evaluator 参数
 # 需要较长的 timeout 以容纳 LLVM 构建 & PolyBench 运行
@@ -57,9 +57,9 @@ database:
 # 可根据机器性能调整 parallel_evaluations
 
 evaluator:
-  timeout: 3600         # 1 小时
-  cascade_evaluation: false
-  cascade_thresholds: [0.95]
+  timeout: 2400         # 40 分钟
+  cascade_evaluation: true
+  cascade_thresholds: [0.7, 0.9]
   parallel_evaluations: 1
   use_llm_feedback: false
 

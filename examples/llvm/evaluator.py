@@ -5,8 +5,10 @@ import subprocess
 import time
 import platform
 import difflib  # 新增：用于生成 diff
+import statistics
 from pathlib import Path
 from typing import Dict, List, Optional
+import concurrent.futures  # 新增：并行评测支持
 
 # -------------------------
 # 用户可通过环境变量覆盖以下路径
@@ -46,6 +48,21 @@ else:
 # ---------- 调试辅助 ----------
 _DEBUG = os.environ.get("LLVM_EVAL_DEBUG", "0") == "1"
 
+# ---------------- 性能波动抵抗 ----------------
+# 通过对每个 kernel 可执行文件进行多次运行并取中位数，降低系统噪声对评测结果的影响。
+# 运行次数可通过环境变量 POLYBENCH_RUNS 配置，默认为 3 次。
+_EXEC_REPEAT = max(1, int(os.environ.get("POLYBENCH_RUNS", "3")))
+
+# warm-up 次数（不计入统计）
+_WARMUP_RUNS = max(0, int(os.environ.get("POLYBENCH_WARMUP", "1")))
+
+# 是否裁剪极端值（当 _EXEC_REPEAT ≥5 时启用）
+_TRIM_EXTREMES = os.environ.get("POLYBENCH_TRIM", "1") == "1"
+
+# CPU 亲和性与 nice 设置（可选）
+_CPU_PIN_ENABLED = os.environ.get("POLYBENCH_CPU_PIN", "0") == "1" and platform.system() == "Linux"
+_CPU_PIN_CORE = os.environ.get("POLYBENCH_CPU_CORE", "0")
+_NICE_VALUE = os.environ.get("POLYBENCH_NICE")  # 若未设置则为 None
 
 def _log(msg: str):
     """仅在环境变量 LLVM_EVAL_DEBUG=1 时打印调试信息"""
@@ -227,12 +244,67 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
     _log(f"编译完成，用时 {compile_time:.2f}s")
 
     # 运行可执行文件
-    _log("开始执行生成的可执行文件…")
-    run_result = subprocess.run([str(exe_path)], capture_output=True, text=True, check=True)
-    out = run_result.stdout + run_result.stderr
-    m = re.findall(r"[0-9]+\.[0-9]+", out)
-    exec_time = float(m[-1]) if m else 0.0
-    _log(f"执行完毕，用时 {exec_time:.2f}s")
+    # ------------------------------
+    # 拼装执行命令（亲和性 + nice）
+    # ------------------------------
+    base_cmd: List[str] = [str(exe_path)]
+    if _CPU_PIN_ENABLED:
+        base_cmd = [
+            "taskset",
+            "-c",
+            str(_CPU_PIN_CORE),
+        ] + base_cmd
+
+    if _NICE_VALUE is not None:
+        base_cmd = ["nice", "-n", str(_NICE_VALUE)] + base_cmd
+
+    # ------------------------------
+    # warm-up（不计入统计）
+    # ------------------------------
+    if _WARMUP_RUNS > 0:
+        _log(f"进行 warm-up { _WARMUP_RUNS } 次…")
+        for w in range(_WARMUP_RUNS):
+            subprocess.run(base_cmd, capture_output=True, text=True, check=True)
+
+    # ------------------------------
+    # 正式多次执行并采样
+    # ------------------------------
+    _log(f"开始正式执行，共 {_EXEC_REPEAT} 次…")
+
+    exec_times: List[float] = []
+    for i in range(_EXEC_REPEAT):
+        if _DEBUG:
+            _log(f"  第 {i + 1}/{_EXEC_REPEAT} 次…")
+
+        run_result = subprocess.run(base_cmd, capture_output=True, text=True, check=True)
+        out = run_result.stdout + run_result.stderr
+        m = re.findall(r"[0-9]+\.[0-9]+", out)
+        t = float(m[-1]) if m else 0.0
+        exec_times.append(t)
+
+        if _DEBUG:
+            _log(f"    耗时 {t:.2f}s")
+
+    # 裁剪极端值（若启用且样本足够）
+    exec_times_sorted = sorted(exec_times)
+    if _TRIM_EXTREMES and len(exec_times_sorted) >= 3:
+        trimmed = exec_times_sorted[1:-1]  # 去掉 min 与 max
+        exec_used = trimmed
+        _log(
+            f"已裁剪极端值: min={exec_times_sorted[0]:.2f}s, "
+            f"max={exec_times_sorted[-1]:.2f}s"
+        )
+    else:
+        exec_used = exec_times_sorted
+
+    # 使用平均数作为代表值（已先裁剪极端值）
+    exec_time = statistics.mean(exec_used)
+
+    _log(
+        "执行完毕，中位耗时 {:.2f}s (采样: {})".format(
+            exec_time, ", ".join(f"{et:.2f}" for et in exec_times)
+        )
+    )
 
     bin_size = exe_path.stat().st_size
     _log(f"二进制体积: {bin_size} 字节")
@@ -244,7 +316,15 @@ def _compile_kernel(clang_path: Path, kernel_rel: str, dataset_macro: str):
 
 
 def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
-    """公共评估逻辑，收集 PolyBench kernel 的编译时间、运行时间以及二进制体积。"""
+    """公共评估逻辑，收集 PolyBench kernel 的编译时间、运行时间以及二进制体积。
+
+    支持通过环境变量 POLYBENCH_PARALLELISM 控制并行度：
+        - 未设置或设为 1 时保持串行，获得最稳定的性能数据；
+        - >1 时启用并行，对不同 kernel 进行并行编译/运行，以加速整体评测。
+
+    由于并行运行可能导致缓存/调度干扰，建议并行度不要超过物理核心数的一半，
+    或者根据具体硬件与负载酌情调整。
+    """
     _log(f"开始评估数据集 {dataset_macro}，共 {len(kernels)} 个 kernels…")
     clang_bin = LLVM_BUILD_DIR / "bin" / "clang"
     if not clang_bin.exists():
@@ -254,11 +334,43 @@ def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
     runtime_total = 0.0
     bin_total = 0
 
-    for k in kernels:
-        c_time, r_time, b_size = _compile_kernel(clang_bin, k, dataset_macro)
-        compile_total += c_time
-        runtime_total += r_time
-        bin_total += b_size
+    # ------------------------------
+    # 并行度配置
+    # ------------------------------
+    try:
+        parallelism = max(1, int(os.environ.get("POLYBENCH_PARALLELISM", "1")))
+    except ValueError:
+        parallelism = 1
+    if parallelism > 1:
+        _log(f"启用并行评测，worker 数: {parallelism}")
+
+    # ------------------------------
+    # 任务执行（并行或串行）
+    # ------------------------------
+    if parallelism > 1:
+        # 使用进程池以避免 GIL 影响，并减少不同 kernel 之间的共享状态冲突
+        with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as pool:
+            future_to_kernel = {
+                pool.submit(_compile_kernel, clang_bin, k, dataset_macro): k for k in kernels
+            }
+            for fut in concurrent.futures.as_completed(future_to_kernel):
+                k_name = future_to_kernel[fut]
+                try:
+                    c_time, r_time, b_size = fut.result()
+                except Exception as exc:
+                    # 传播异常，同时补充 kernel 名称，方便定位
+                    raise RuntimeError(f"Kernel {k_name} 评测失败: {exc}") from exc
+                compile_total += c_time
+                runtime_total += r_time
+                bin_total += b_size
+    else:
+        # 串行执行（默认）
+        for k in kernels:
+            c_time, r_time, b_size = _compile_kernel(clang_bin, k, dataset_macro)
+            compile_total += c_time
+            runtime_total += r_time
+            bin_total += b_size
+
     _log(
         f"数据集 {dataset_macro} 完成：总编译时间 {compile_total:.2f}s，"
         f"总运行时间 {runtime_total:.2f}s，累积二进制体积 {bin_total} 字节"
@@ -297,7 +409,12 @@ SCORING_WEIGHTS = {
 
 _EPS = 1e-9  # 防止除零
 
-def _evaluate_candidate(program_path: str, dataset_macro: str, kernels: List[str]):
+def _evaluate_candidate(
+    program_path: str,
+    dataset_macro: str,
+    kernels: List[str],
+    rebuild_llvm: bool = True,
+):
     """公共流程：写入候选 → 评估 → 计算归一化指标
 
     评分因子：
@@ -314,9 +431,16 @@ def _evaluate_candidate(program_path: str, dataset_macro: str, kernels: List[str
     # 写入候选代码
     _write_candidate_to_llvm(program_path)
 
-    # ---------- 编译 LLVM
+    # ---------- 编译 LLVM（可选）
     _configure_llvm_once()
-    build_time = _rebuild_clang()
+
+    # 如果禁用重建，则仅当 clang 不存在时才强制构建
+    need_rebuild = rebuild_llvm or not (LLVM_BUILD_DIR / "bin" / "clang").exists()
+
+    if need_rebuild:
+        build_time = _rebuild_clang()
+    else:
+        build_time = 0.0  # 跳过重建
 
     # ---------- PolyBench 测试
     cand_metrics = _evaluate(dataset_macro, kernels)
@@ -419,14 +543,20 @@ def evaluate_stage1(program_path: str):
 
 def evaluate_stage2(program_path: str):
     try:
-        return _evaluate_candidate(program_path, "STANDARD_DATASET", STAGE2_KERNELS)
+        # Stage-2 默认复用 Stage-1 已经构建好的 LLVM，无需再次重建
+        return _evaluate_candidate(
+            program_path,
+            "STANDARD_DATASET",
+            STAGE2_KERNELS,
+            rebuild_llvm=False,
+        )
     except Exception as e:
         return _exception_details(e)
     finally:
         _restore_original_llvm_file()
 
 
-# 保持 evaluate 与 stage2 等价，方便直接调用
+# 保持 evaluate 与 stage1 等价，方便直接调用
 
 def evaluate(program_path: str):
     return evaluate_stage1(program_path)

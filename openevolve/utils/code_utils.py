@@ -196,18 +196,33 @@ def extract_code_language(code: str) -> str:
     Returns:
         Detected language or "unknown"
     """
-    # Look for common language signatures
-    if re.search(r"^(import|from|def|class)\s", code, re.MULTILINE):
-        return "python"
-    elif re.search(r"^(package|import java|public class)", code, re.MULTILINE):
-        return "java"
-    elif re.search(r"^(#include|int main|void main)", code, re.MULTILINE):
+    # Detect C/C++ first to avoid misclassifying "class X" declarations as Python
+    if re.search(r"^(#include|int main|void main)", code, re.MULTILINE):
         return "cpp"
-    elif re.search(r"^(function|var|let|const|console\.log)", code, re.MULTILINE):
+
+    # Java (match before Python to avoid the generic "class" keyword confusion)
+    if re.search(r"^(package|import java|public class)", code, re.MULTILINE):
+        return "java"
+
+    # Python – require patterns that are distinctive for Python such as a trailing
+    # colon on class/def lines or common import styles.
+    if re.search(r"^(import|from)\s+\w+", code, re.MULTILINE):
+        return "python"
+    if re.search(r"^def\s+\w+\s*\(.*\)\s*:", code, re.MULTILINE):
+        return "python"
+    if re.search(r"^class\s+\w+\s*:\s*", code, re.MULTILINE):
+        return "python"
+
+    # JavaScript
+    if re.search(r"^(function|var|let|const|console\.log)", code, re.MULTILINE):
         return "javascript"
-    elif re.search(r"^(module|fn|let mut|impl)", code, re.MULTILINE):
+
+    # Rust
+    if re.search(r"^(module|fn|let mut|impl)", code, re.MULTILINE):
         return "rust"
-    elif re.search(r"^(SELECT|CREATE TABLE|INSERT INTO)", code, re.MULTILINE):
+
+    # SQL
+    if re.search(r"^(SELECT|CREATE TABLE|INSERT INTO)", code, re.MULTILINE):
         return "sql"
 
     return "unknown"

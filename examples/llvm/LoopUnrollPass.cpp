@@ -184,6 +184,7 @@ static cl::opt<unsigned> PragmaUnrollFullMaxIterations(
 /// code expansion would result.
 static const unsigned NoThreshold = std::numeric_limits<unsigned>::max();
 
+# EVOLVE-BLOCK-START
 /// Gather the various unrolling parameters based on the defaults, compiler
 /// flags, TTI overrides and user specified parameters.
 TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
@@ -281,6 +282,7 @@ TargetTransformInfo::UnrollingPreferences llvm::gatherUnrollingPreferences(
 
   return UP;
 }
+# EVOLVE-BLOCK-END
 
 namespace {
 
@@ -859,8 +861,10 @@ static std::optional<unsigned> shouldFullUnroll(
           L, FullUnrollTripCount, DT, SE, EphValues, TTI,
           UP.Threshold * UP.MaxPercentThresholdBoost / 100,
           UP.MaxIterationsCountToAnalyze)) {
+# EVOLVE-BLOCK-START
     unsigned Boost =
       getFullUnrollBoostingFactor(*Cost, UP.MaxPercentThresholdBoost);
+# EVOLVE-BLOCK-END
     if (Cost->UnrolledCost < UP.Threshold * Boost / 100)
       return FullUnrollTripCount;
   }
@@ -1215,10 +1219,12 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,
     return LoopUnrollResult::Unmodified;
 
   bool OptForSize = L->getHeader()->getParent()->hasOptSize();
+# EVOLVE-BLOCK-START
   TargetTransformInfo::UnrollingPreferences UP = gatherUnrollingPreferences(
       L, SE, TTI, BFI, PSI, ORE, OptLevel, ProvidedThreshold, ProvidedCount,
       ProvidedAllowPartial, ProvidedRuntime, ProvidedUpperBound,
       ProvidedFullUnrollMaxCount);
+# EVOLVE-BLOCK-END
   TargetTransformInfo::PeelingPreferences PP = gatherPeelingPreferences(
       L, SE, TTI, ProvidedAllowPeeling, ProvidedAllowProfileBasedPeeling, true);
 
