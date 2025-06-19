@@ -6,6 +6,8 @@ import time
 import platform
 import difflib  # 新增：用于生成 diff
 import statistics
+import sys
+import types
 from pathlib import Path
 from typing import Dict, List, Optional
 import concurrent.futures  # 新增：并行评测支持
@@ -50,11 +52,11 @@ _DEBUG = os.environ.get("LLVM_EVAL_DEBUG", "0") == "1"
 
 # ---------------- 性能波动抵抗 ----------------
 # 通过对每个 kernel 可执行文件进行多次运行并取中位数，降低系统噪声对评测结果的影响。
-# 运行次数可通过环境变量 POLYBENCH_RUNS 配置，默认为 3 次。
-_EXEC_REPEAT = max(1, int(os.environ.get("POLYBENCH_RUNS", "3")))
+# 运行次数可通过环境变量 POLYBENCH_RUNS 配置，默认为 1 次。
+_EXEC_REPEAT = max(1, int(os.environ.get("POLYBENCH_RUNS", "1")))
 
 # warm-up 次数（不计入统计）
-_WARMUP_RUNS = max(0, int(os.environ.get("POLYBENCH_WARMUP", "1")))
+_WARMUP_RUNS = max(0, int(os.environ.get("POLYBENCH_WARMUP", "0")))
 
 # 是否裁剪极端值（当 _EXEC_REPEAT ≥5 时启用）
 _TRIM_EXTREMES = os.environ.get("POLYBENCH_TRIM", "1") == "1"
@@ -382,10 +384,29 @@ def _evaluate(dataset_macro: str, kernels: List[str]) -> Dict[str, float]:
         "bin_total_bytes": bin_total,
     }
 
-# ---------------- 公开的评估接口 ----------------
+# ----------------------------
+# 进程内共享基线缓存
+# ----------------------------
+# 在 OpenEvolve 的评估过程中，evaluation_module 会被反复以新的 module 对象动态
+# 载入。若直接在本文件使用普通的模块级全局变量来保存基线，则每次加载都会重置，
+# 导致无法利用之前已测得的 baseline。
+#
+# 这里通过在 `sys.modules` 注册一个自定义的临时模块来保存共享状态。由于 Python
+# 会对同名 module 进行缓存，不同次加载本 evaluator 文件时，只要进程未结束，
+# 都能拿到同一份 `shared_state`，从而实现基线跨加载持久化，而无需写入磁盘。
 
-# 仅在内存缓存基线
-_BASELINE_CACHE: Dict[str, float] = {}
+_SHARED_MOD = "_llvm_evaluator_shared_state"
+
+if _SHARED_MOD not in sys.modules:
+    shared_state = types.ModuleType(_SHARED_MOD)
+    # 使用 type: ignore 避免静态检查器关于动态属性的告警
+    shared_state.BASELINE_CACHE = {}  # type: ignore[attr-defined]
+    sys.modules[_SHARED_MOD] = shared_state
+else:
+    shared_state = sys.modules[_SHARED_MOD]
+
+# `shared_state.BASELINE_CACHE` 即为跨 module 实例共享的字典。
+_BASELINE_CACHE: Dict[str, float] = shared_state.BASELINE_CACHE
 
 # 返回当前进程基线缓存（若为空则说明尚未初始化）
 def _load_baseline() -> Dict[str, float]:
@@ -457,12 +478,15 @@ def _evaluate_candidate(
     if runtime_key not in baseline:
         baseline[runtime_key] = cand_metrics["runtime_total_sec"]
         updated_baseline = True
+        _log(f"基线缺失 {runtime_key}，使用候选值: {cand_metrics['runtime_total_sec']:.2f}s")
     if compile_key not in baseline:
         baseline[compile_key] = cand_metrics["compile_total_sec"]
         updated_baseline = True
+        _log(f"基线缺失 {compile_key}，使用候选值: {cand_metrics['compile_total_sec']:.2f}s")
     if bin_key not in baseline:
         baseline[bin_key] = cand_metrics["bin_total_bytes"]
         updated_baseline = True
+        _log(f"基线缺失 {bin_key}，使用候选值: {cand_metrics['bin_total_bytes']} bytes")
 
     # 其他可能缺失的通用字段
     if "llvm_build_time_sec" not in baseline:

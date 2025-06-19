@@ -1,5 +1,5 @@
-max_iterations: 10
-checkpoint_interval: 5
+max_iterations: 40
+checkpoint_interval: 10
 log_level: "INFO"
 
 # LLM configuration (示例占位，可根据实际 API 调整)
@@ -16,30 +16,7 @@ llm:
 
 # Prompt configuration
 prompt:
-  system_message: |
-    You are a compiler optimization expert. Your goal is to improve the code enclosed by the EVOLVE tags inside LLVM's LoopUnrollPass.cpp so that programs produced by the new clang compiler run faster on the PolyBench benchmark suite while keeping compilation time acceptable.
-
-    IMPORTANT RULES – READ CAREFULLY:
-    1. Only modify lines that lie strictly BETWEEN the markers "# EVOLVE-BLOCK-START" and "# EVOLVE-BLOCK-END".
-    2. Do NOT modify, move, add, or delete any code outside those markers.
-    3. Provide your edits STRICTLY as one or more diff patches in the exact format shown below (keep the capital words and the delimiter lines exactly):
-
-       <<<<<<< SEARCH
-       # Original code to find and replace (must match exactly)
-       =======
-       # New replacement code
-       >>>>>>> REPLACE
-
-    You may include multiple SEARCH/REPLACE blocks if you need to make several independent edits. Separate each full block with a single blank line.
-
-    CRITICAL CONSTRAINTS – MUST FOLLOW:
-    • The SEARCH section must contain only the MINIMUM number of lines required to uniquely identify the code you intend to replace. Do NOT copy large chunks of unchanged code or the entire EVOLVE block.
-    • Outside the diff blocks you must NOT output ANY other code or commentary. In particular, DO NOT output the full content of LoopUnrollPass.cpp or the entire EVOLVE block.
-    • Do NOT wrap your answer inside markdown fences or add explanations before or after the diff blocks. The response must contain ONLY the diff patch(es).
-
-    If any of the above constraints are violated the submission will receive a score of zero.
-
-    Always adhere to C++17 syntax.
+  system_message: You are a compiler optimization expert. Your goal is to improve the code enclosed by the EVOLVE-BLOCK-START and EVOLVE-BLOCK-END tags inside LLVM's LoopUnrollPass.cpp so that programs produced by the new clang compiler run faster on the PolyBench benchmark suite while keeping compilation time acceptable. Always adhere to C++17 syntax.
   num_top_programs: 4
   use_template_stochasticity: true
 
@@ -59,7 +36,7 @@ database:
 evaluator:
   timeout: 2400         # 40 分钟
   cascade_evaluation: true
-  cascade_thresholds: [0.7, 0.9]
+  cascade_thresholds: [0.99, 1]
   parallel_evaluations: 1
   use_llm_feedback: false
 
