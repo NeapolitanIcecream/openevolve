@@ -1,4 +1,4 @@
-max_iterations: 40
+max_iterations: 100
 checkpoint_interval: 10
 log_level: "INFO"
 
@@ -22,11 +22,11 @@ prompt:
 
 # Database / evolution 参数
 database:
-  population_size: 40
-  archive_size: 20
+  population_size: 60
+  archive_size: 24
   num_islands: 4
   elite_selection_ratio: 0.25
-  exploitation_ratio: 0.6
+  exploitation_ratio: 0.5
 
 # Evaluator 参数
 # 需要较长的 timeout 以容纳 LLVM 构建 & PolyBench 运行
@@ -35,8 +35,8 @@ database:
 
 evaluator:
   timeout: 2400         # 40 分钟
-  cascade_evaluation: true
-  cascade_thresholds: [0.99, 1]
+  cascade_evaluation: false
+  cascade_thresholds: [0.95, 1]
   parallel_evaluations: 1
   use_llm_feedback: false
 
