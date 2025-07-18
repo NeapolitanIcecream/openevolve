@@ -13,10 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /app
 
 # Install Python dependencies
-RUN pip install --root-user-action=ignore -e .
+RUN pip install uv && uv sync
 
 # Expose the project directory as a volume
 VOLUME ["/app"]
 
 # Set the entry point to the openevolve-run.py script
-ENTRYPOINT ["python", "/app/openevolve-run.py"]
+ENTRYPOINT ["uv", "run", "python", "/app/openevolve-run.py"]
