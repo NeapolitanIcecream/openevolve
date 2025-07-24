@@ -4,6 +4,20 @@ An open-source evolutionary coding agent that began as a faithful implementation
 
 ![OpenEvolve Logo](openevolve-logo.png)
 
+## About This Fork
+
+[简体中文](./docs/about-this-fork-CN.md)
+
+This repository is forked from [OpenEvolve](https://github.com/codelion/openevolve) and differs in several key ways:
+
+1. Supports end-to-end code-base evolution, providing a full, working replica of [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms).  
+   - Each organism in the population is now a single Git commit, which can touch multiple files.
+   - Similarity is computed incrementally and fast with locality-sensitive hashing (LSH).
+   - A child is simply the next commit after its parent, so the Git history itself becomes a transparent record of the evolutionary process.
+2. Makes aggressive use of the KV cache to give the model far more context while keeping costs in check, resulting in better performance.  
+3. Replaces the rigid, preset workflow with flexible, on-the-fly tool invocation.  
+4. Includes various minor optimizations and bug fixes.
+
 ## Overview
 
 OpenEvolve is an evolutionary coding agent that uses Large Language Models to automatically optimize and discover algorithms through iterative improvement. Starting from the AlphaEvolve research, it incorporates advanced features for reproducibility, multi-language support, sophisticated evaluation pipelines, and integration with cutting-edge LLM optimization techniques. It serves as both a research platform for evolutionary AI and a practical tool for automated code optimization.
