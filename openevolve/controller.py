@@ -17,6 +17,7 @@ from openevolve.evaluator import Evaluator
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.prompt.sampler import PromptSampler
 from openevolve.process_parallel import ProcessParallelController
+from openevolve.tools.registry import ToolRegistry
 from openevolve.utils.code_utils import (
     extract_code_language,
 )
@@ -137,9 +138,23 @@ class OpenEvolve:
             if not self.file_extension.startswith("."):
                 self.file_extension = f".{self.file_extension}"
 
-        # Initialize components
-        self.llm_ensemble = LLMEnsemble(self.config.llm.models)
-        self.llm_evaluator_ensemble = LLMEnsemble(self.config.llm.evaluator_models)
+        # Initialize components in the correct order to handle dependencies
+        # 1. ToolRegistry is created first.
+        self.tool_registry = ToolRegistry(
+            config={"root_dir": os.path.dirname(initial_program_path)}
+        )
+
+        # 2. LLMEnsembles are created, passing the tool_registry to them.
+        self.llm_ensemble = LLMEnsemble(
+            self.config.llm.models, tool_registry=self.tool_registry
+        )
+        self.llm_evaluator_ensemble = LLMEnsemble(
+            self.config.llm.evaluator_models, tool_registry=self.tool_registry
+        )
+
+        # 3. The LLM client is set back into the tool_registry to resolve circular dependency.
+        self.tool_registry.set_llm_client(self.llm_ensemble)
+        
 
         self.prompt_sampler = PromptSampler(self.config.prompt)
         self.evaluator_prompt_sampler = PromptSampler(self.config.prompt)
@@ -280,7 +295,8 @@ class OpenEvolve:
             # Set up signal handlers for graceful shutdown
             def signal_handler(signum, frame):
                 logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-                self.parallel_controller.request_shutdown()
+                if self.parallel_controller:
+                    self.parallel_controller.request_shutdown()
 
                 # Set up a secondary handler for immediate exit if user presses Ctrl+C again
                 def force_exit_handler(signum, frame):
@@ -459,6 +475,10 @@ class OpenEvolve:
         """Run evolution with checkpoint saving support"""
         logger.info(f"Using island-based evolution with {self.config.database.num_islands} islands")
         self.database.log_island_status()
+
+        if not self.parallel_controller:
+            logger.error("Parallel controller not initialized.")
+            return
 
         # Run the evolution process with checkpoint callback
         await self.parallel_controller.run_evolution(

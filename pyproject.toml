@@ -18,6 +18,8 @@ dependencies = [
     "numpy>=1.22.0",
     "tqdm>=4.64.0",
     "flask",
+    "pathspec>=0.12.1",
+    "diff-match-patch>=20241021",
 ]
 
 [project.optional-dependencies]

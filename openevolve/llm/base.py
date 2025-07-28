@@ -20,3 +20,15 @@ class LLMInterface(ABC):
     ) -> str:
         """Generate text using a system message and conversational context"""
         pass
+
+    @abstractmethod
+    async def generate_json(
+        self, prompt: str, json_schema: Dict[str, Any], **kwargs
+    ) -> Dict[str, Any]:
+        """Generate text from a prompt and parse it as JSON"""
+        pass
+
+    @abstractmethod
+    async def get_history(self) -> List[Dict[str, Any]]:
+        """Get the conversation history"""
+        pass
