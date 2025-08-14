@@ -139,17 +139,15 @@ class OpenEvolve:
                 self.file_extension = f".{self.file_extension}"
 
         # Initialize components in the correct order to handle dependencies
-        # 1. ToolRegistry is created first.
+        # 1. ToolRegistry is created first（注册读/写与评估工具）。
         self.tool_registry = ToolRegistry(
-            config={"root_dir": os.path.dirname(initial_program_path)}
+            config={"root_dir": os.path.dirname(initial_program_path)},
+            evaluator=None,  # 评估工具在 Evaluator 初始化后注入
         )
 
-        # 2. LLMEnsembles are created, passing the tool_registry to them.
+        # 2. LLM ensemble（用于代码读写工具调用）。
         self.llm_ensemble = LLMEnsemble(
             self.config.llm.models, tool_registry=self.tool_registry
-        )
-        self.llm_evaluator_ensemble = LLMEnsemble(
-            self.config.llm.evaluator_models, tool_registry=self.tool_registry
         )
 
         # 3. The LLM client is set back into the tool_registry to resolve circular dependency.
@@ -157,8 +155,6 @@ class OpenEvolve:
         
 
         self.prompt_sampler = PromptSampler(self.config.prompt)
-        self.evaluator_prompt_sampler = PromptSampler(self.config.prompt)
-        self.evaluator_prompt_sampler.set_templates("evaluator_system_message")
 
         # Pass random seed to database if specified
         if self.config.random_seed is not None:
@@ -169,11 +165,12 @@ class OpenEvolve:
         self.evaluator = Evaluator(
             self.config.evaluator,
             evaluation_file,
-            self.llm_evaluator_ensemble,
-            self.evaluator_prompt_sampler,
             database=self.database,
         )
         self.evaluation_file = evaluation_file
+
+        # 将 evaluator 注入工具注册表，提供 evaluate 工具
+        self.tool_registry.set_evaluator(self.evaluator)
 
         logger.info(f"Initialized OpenEvolve with {initial_program_path}")
 
@@ -237,49 +234,21 @@ class OpenEvolve:
         else:
             start_iteration = self.database.last_iteration
 
-        # Only add initial program if starting fresh (not resuming from checkpoint)
-        should_add_initial = (
-            start_iteration == 0
-            and len(self.database.programs) == 0
-            and not any(
-                p.code == self.initial_program_code for p in self.database.programs.values()
-            )
-        )
+        # 仅当数据库为空时，添加“初始 commit 个体”（commit-based）
+        should_add_initial = start_iteration == 0 and len(self.database.programs) == 0
 
         if should_add_initial:
-            logger.info("Adding initial program to database")
+            logger.info("Adding initial commit-based program to database")
             initial_program_id = str(uuid.uuid4())
-
-            # Evaluate the initial program
-            initial_metrics = await self.evaluator.evaluate_program(
-                self.initial_program_code, initial_program_id
-            )
-
+            # 以 root_commit 作为初始个体（与 root 的 diff 为空）
             initial_program = Program(
                 id=initial_program_id,
-                code=self.initial_program_code,
-                language=self.config.language,
-                metrics=initial_metrics,
+                commit_hash=self.config.database.root_commit,
+                language=self.config.language or "python",
+                metrics={},
                 iteration_found=start_iteration,
             )
-
             self.database.add(initial_program)
-            
-            # Check if combined_score is present in the metrics
-            if "combined_score" not in initial_metrics:
-                # Calculate average of numeric metrics
-                numeric_metrics = [
-                    v for v in initial_metrics.values() 
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                ]
-                if numeric_metrics:
-                    avg_score = sum(numeric_metrics) / len(numeric_metrics)
-                    logger.warning(
-                        f"⚠️  No 'combined_score' metric found in evaluation results. "
-                        f"Using average of all numeric metrics ({avg_score:.4f}) for evolution guidance. "
-                        f"For better evolution results, please modify your evaluator to return a 'combined_score' "
-                        f"metric that properly weights different aspects of program performance."
-                    )
         else:
             logger.info(
                 f"Skipping initial program addition (resuming from iteration {start_iteration} "
@@ -428,10 +397,10 @@ class OpenEvolve:
             best_program = self.database.get_best_program()
 
         if best_program:
-            # Save the best program at this checkpoint
-            best_program_path = os.path.join(checkpoint_path, f"best_program{self.file_extension}")
-            with open(best_program_path, "w") as f:
-                f.write(best_program.code)
+            # 在 commit-based 模式下，保存最佳提交哈希
+            best_commit_path = os.path.join(checkpoint_path, "best_commit.txt")
+            with open(best_commit_path, "w") as f:
+                f.write(str(best_program.commit_hash))
 
             # Save metrics
             best_program_info_path = os.path.join(checkpoint_path, "best_program_info.json")
@@ -519,12 +488,10 @@ class OpenEvolve:
         best_dir = os.path.join(self.output_dir, "best")
         os.makedirs(best_dir, exist_ok=True)
 
-        # Use the extension from the initial program file
-        filename = f"best_program{self.file_extension}"
-        code_path = os.path.join(best_dir, filename)
-
-        with open(code_path, "w") as f:
-            f.write(program.code)
+        # 在 commit-based 模式下，仅保存最佳提交哈希
+        commit_path = os.path.join(best_dir, "best_commit.txt")
+        with open(commit_path, "w") as f:
+            f.write(str(program.commit_hash))
 
         # Save complete program info including metrics
         info_path = os.path.join(best_dir, "best_program_info.json")
@@ -546,4 +513,4 @@ class OpenEvolve:
                 indent=2,
             )
 
-        logger.info(f"Saved best program to {code_path} with program info to {info_path}")
+        logger.info(f"Saved best commit to {commit_path} with program info to {info_path}")

@@ -15,7 +15,6 @@ from .file_utils import (
     detect_file_type,
     process_single_file_content,
 )
-from .schemas import sanitize_parameters
 
 DEFAULT_EXCLUDES: List[str] = [
     "**/node_modules/**",
@@ -155,7 +154,7 @@ class ReadManyFilesTool(BaseTool):
             included_files, respect_git_ignore, respect_gemini_ignore
         )
 
-        content_parts = []
+        content_parts: List[str] = []
         processed_files_relative_paths = []
         skipped_files = []
 
@@ -185,11 +184,8 @@ class ReadManyFilesTool(BaseTool):
             if result.get("error"):
                 skipped_files.append({"path": relative_path, "reason": result["error"]})
             else:
-                if isinstance(result["llmContent"], dict):  # Binary file part
-                    content_parts.append(result["llmContent"])
-                else:  # Text file
-                    separator = DEFAULT_OUTPUT_SEPARATOR_FORMAT.replace("{filePath}", file_path)
-                    content_parts.append(f'{separator}\n\n{result["llmContent"]}\n\n')
+                separator = DEFAULT_OUTPUT_SEPARATOR_FORMAT.replace("{filePath}", file_path)
+                content_parts.append(f'{separator}\n\n{result["llmContent"]}\n\n')
                 processed_files_relative_paths.append(relative_path)
 
         # Build display message
@@ -224,4 +220,5 @@ class ReadManyFilesTool(BaseTool):
         if not content_parts:
             content_parts.append("No files matching the criteria were found or all were skipped.")
 
-        return ToolResult(llm_content=content_parts, return_display=display_message.strip())
+        llm_body = "".join(content_parts)
+        return ToolResult(llm_content=llm_body, return_display=display_message.strip())

@@ -13,8 +13,8 @@ from .edit import EditTool
 from .read_file import ReadFileTool
 from .read_many_files import ReadManyFilesTool
 from .config import Config as ToolConfig
-from .schemas import sanitize_parameters
 from ..llm.base import LLMInterface
+from .evaluator import EvaluateTool
 
 
 # A simple type alias for the config object for now.
@@ -120,11 +120,12 @@ class ToolRegistry:
     Manages the registration and discovery of tools.
     """
 
-    def __init__(self, config: Config, llm_client: Optional[LLMInterface] = None):
+    def __init__(self, config: Config, llm_client: Optional[LLMInterface] = None, evaluator: Optional[Any] = None):
         self.config = config
         self.tool_config = ToolConfig(root_dir=self.config.get("root_dir") or ".")
         self._tools: Dict[str, Tool] = {}
         self.llm_client = llm_client
+        self._evaluator = evaluator
         self._register_builtin_tools()
 
     def _register_builtin_tools(self):
@@ -139,10 +140,17 @@ class ToolRegistry:
         
         self.register_tool(ReadFileTool(config=self.tool_config))
         self.register_tool(ReadManyFilesTool(config=self.tool_config))
+        if self._evaluator is not None:
+            self.register_tool(EvaluateTool(evaluator=self._evaluator, config=self.tool_config))
 
     def set_llm_client(self, llm_client: LLMInterface):
         """Sets the LLM client and re-registers tools that require it."""
         self.llm_client = llm_client
+        self._register_builtin_tools()
+
+    def set_evaluator(self, evaluator: Any):
+        """Sets evaluator for the evaluation tool and re-registers it."""
+        self._evaluator = evaluator
         self._register_builtin_tools()
 
     def register_tool(self, tool: Tool):
@@ -204,31 +212,28 @@ class ToolRegistry:
 
             discovered_items = json.loads(stdout.decode().strip())
             if not isinstance(discovered_items, list):
-                raise TypeError("Tool discovery command did not return a JSON array of tools.")
+                raise TypeError("Tool discovery command must return a JSON array of tools.")
 
+            # 仅接受 OpenAI 风格：{"type":"function","function":{"name":...,"description":...,"parameters":{...}}}
             functions: List[Schema] = []
-            for tool_info in discovered_items:
-                if isinstance(tool_info, dict):
-                    if "function_declarations" in tool_info and isinstance(
-                        tool_info["function_declarations"], list
-                    ):
-                        functions.extend(tool_info["function_declarations"])
-                    elif "functionDeclarations" in tool_info and isinstance(
-                        tool_info["functionDeclarations"], list
-                    ):
-                        functions.extend(tool_info["functionDeclarations"])
-                    elif "name" in tool_info:
-                        functions.append(tool_info)
+            for item in discovered_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "function" and isinstance(item.get("function"), dict):
+                    fn = item["function"]
+                    if fn.get("name"):
+                        functions.append(fn)
+                elif item.get("name"):
+                    # 兼容性已移除；这里只在输入直接就是 function 对象时接受
+                    functions.append(item)
 
             for func in functions:
                 if not func.get("name"):
                     print("Warning: Discovered a tool with no name. Skipping.")
                     continue
 
-                parameters = func.get("parameters", {})
-                if isinstance(parameters, dict):
-                    sanitize_parameters(parameters)
-                else:
+                parameters = func.get("parameters") or {}
+                if not isinstance(parameters, dict):
                     parameters = {}
 
                 self.register_tool(

@@ -45,7 +45,7 @@ class ToolResult:
     Represents the result of a tool execution.
     """
 
-    llm_content: Union[str, List[Union[str, Dict[str, Any]]]]
+    llm_content: str
     return_display: ToolResultDisplay
     summary: str | None = None
 

@@ -2,12 +2,12 @@
 Model ensemble for LLMs
 """
 
-import asyncio
 import logging
 import random
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 
-from openevolve.llm.base import LLMInterface
+from openevolve.llm.base import LLMInterface, LLMResult
+from openevolve.llm.session import ConversationSession
 from openevolve.llm.openai import OpenAILLM
 from openevolve.config import LLMModelConfig
 from openevolve.tools.registry import ToolRegistry
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class LLMEnsemble(LLMInterface):
-    """Ensemble of LLMs"""
+    """Ensemble of LLMs using unified invoke API"""
     _ensemble_logged: bool = False
 
     def __init__(self, models_cfg: List[LLMModelConfig], tool_registry: Optional[ToolRegistry] = None):
@@ -54,67 +54,62 @@ class LLMEnsemble(LLMInterface):
             )
             LLMEnsemble._ensemble_logged = True
 
-        # Centralized history buffer to keep chronological order across models
-        self._history: List[Dict[str, Any]] = []
-
-    async def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text using a randomly selected model based on weights"""
-        model = self._sample_model()
-        # Capture history before and after to maintain global order
-        prev_len = len(await model.get_history())
-        response = await model.generate(prompt, **kwargs)
-        new_entries = (await model.get_history())[prev_len:]
-        self._history.extend(new_entries)
-        return response
-
-    async def generate_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
-    ) -> str:
-        """Generate text using a system message and conversational context"""
-        model = self._sample_model()
-        prev_len = len(await model.get_history())
-        response = await model.generate_with_context(system_message, messages, **kwargs)
-        new_entries = (await model.get_history())[prev_len:]
-        self._history.extend(new_entries)
-        return response
+        # Shared session across ensemble members
+        self._session: Optional[ConversationSession] = None
 
     def _sample_model(self) -> LLMInterface:
-        """Sample a model from the ensemble based on weights"""
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
         sampled_model = self.models[index]
         logger.info(f"Sampled model: {vars(sampled_model)['model']}")
         return sampled_model
 
-    async def generate_multiple(self, prompt: str, n: int, **kwargs) -> List[str]:
-        """Generate multiple texts in parallel"""
-        tasks = [self.generate(prompt, **kwargs) for _ in range(n)]
-        return await asyncio.gather(*tasks)
-
-    async def parallel_generate(self, prompts: List[str], **kwargs) -> List[str]:
-        """Generate responses for multiple prompts in parallel"""
-        tasks = [self.generate(prompt, **kwargs) for prompt in prompts]
-        return await asyncio.gather(*tasks)
-
-    async def generate_all_with_context(
-        self, system_message: str, messages: List[Dict[str, str]], **kwargs
-    ) -> List[str]:
-        """Generate text using a all available models and average their returned metrics"""
-        responses = []
-        for model in self.models:
-            responses.append(await model.generate_with_context(system_message, messages, **kwargs))
-        return responses
-
-    async def generate_json(
-        self, prompt: str, json_schema: Dict[str, Any], **kwargs
-    ) -> Dict[str, Any]:
-        """Generate json using a randomly selected model based on weights"""
+    async def invoke(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        system_message: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        seed: Optional[int] = None,
+        timeout: Optional[float] = None,
+        retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+    ) -> LLMResult:
         model = self._sample_model()
-        prev_len = len(await model.get_history())
-        response = await model.generate_json(prompt, json_schema, **kwargs)
-        new_entries = (await model.get_history())[prev_len:]
-        self._history.extend(new_entries)
-        return response
+        return await model.invoke(
+            messages=messages,
+            system_message=system_message,
+            response_format=response_format,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            seed=seed,
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+        )
 
     async def get_history(self) -> List[Dict[str, Any]]:
-        """Get the aggregated conversation history in chronological order"""
-        return self._history
+        return self._session.get_history() if self._session else []
+
+    def attach_session(self, session: ConversationSession) -> None:
+        self._session = session
+        for m in self.models:
+            try:
+                m.attach_session(session)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def detach_session(self) -> None:
+        for m in self.models:
+            try:
+                m.detach_session()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        self._session = None

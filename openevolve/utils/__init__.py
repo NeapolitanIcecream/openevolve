@@ -25,6 +25,7 @@ from openevolve.utils.metrics_utils import (
     safe_numeric_average,
     safe_numeric_sum,
 )
+from .diff_utils import clean_diff, minhash_signature, minhash_similarity
 
 __all__ = [
     "TaskPool",

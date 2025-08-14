@@ -96,6 +96,6 @@ class ReadFileTool(BaseTool):
         )
 
         if result.get("error"):
-            return ToolResult(llm_content=result["error"], return_display=result["returnDisplay"])
+            return ToolResult(llm_content=str(result["error"]), return_display=result["returnDisplay"])
 
-        return ToolResult(llm_content=result["llmContent"], return_display=result["returnDisplay"])
+        return ToolResult(llm_content=str(result["llmContent"]), return_display=result["returnDisplay"])

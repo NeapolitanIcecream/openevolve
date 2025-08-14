@@ -15,23 +15,23 @@ class LLMModelConfig:
     """Configuration for a single LLM model"""
 
     # API configuration
-    api_base: str = None
+    api_base: Optional[str] = None
     api_key: Optional[str] = None
-    name: str = None
+    name: Optional[str] = None
 
     # Weight for model in ensemble
     weight: float = 1.0
 
     # Generation parameters
     system_message: Optional[str] = None
-    temperature: float = None
-    top_p: float = None
-    max_tokens: int = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
 
     # Request parameters
-    timeout: int = None
-    retries: int = None
-    retry_delay: int = None
+    timeout: Optional[int] = None
+    retries: Optional[int] = None
+    retry_delay: Optional[int] = None
 
     # Reproducibility
     random_seed: Optional[int] = None
@@ -65,12 +65,14 @@ class LLMConfig(LLMModelConfig):
 
     # n-model configuration for evaluator LLM ensemble
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
+    # Model used when the agent needs to perform write operations
+    write_tool_model_name: Optional[str] = None
 
     # Backwardes compatibility with primary_model(_weight) options
-    primary_model: str = None
-    primary_model_weight: float = None
-    secondary_model: str = None
-    secondary_model_weight: float = None
+    primary_model: Optional[str] = None
+    primary_model_weight: Optional[float] = None
+    secondary_model: Optional[str] = None
+    secondary_model_weight: Optional[float] = None
 
     def __post_init__(self):
         """Post-initialization to set up model configurations"""
@@ -142,6 +144,12 @@ class PromptConfig:
     max_artifact_bytes: int = 20 * 1024  # 20KB in prompt
     artifact_security_filter: bool = True
 
+    # --- Long-session management (KV-cache friendly) ---
+    session_max_tokens: int = 120000
+    session_compress_threshold: int = 80000
+    recent_history_tokens: int = 30000
+    compression_model_name: Optional[str] = None
+
 
 @dataclass
 class DatabaseConfig:
@@ -163,7 +171,16 @@ class DatabaseConfig:
     elite_selection_ratio: float = 0.1
     exploration_ratio: float = 0.2
     exploitation_ratio: float = 0.7
-    diversity_metric: str = "edit_distance"  # Options: "edit_distance", "feature_based"
+
+    # Evolution target description & similarity control
+    evolution_target: Optional[str] = None
+    signature_similarity_threshold: float = 0.8
+
+    # Git evolution settings
+    # Root commit used as baseline for diff (e.g. initial commit SHA or main branch)
+    root_commit: str = "HEAD"
+    # Path to the git repository (defaults to current working directory)
+    git_repo_path: str = "."
 
     # Feature map dimensions for MAP-Elites
     # Default to complexity and diversity for better exploration
@@ -224,7 +241,7 @@ class Config:
     log_level: str = "INFO"
     log_dir: Optional[str] = None
     random_seed: Optional[int] = 42
-    language: str = None
+    language: Optional[str] = None
 
     # Component configurations
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -297,6 +314,7 @@ class Config:
                 "timeout": self.llm.timeout,
                 "retries": self.llm.retries,
                 "retry_delay": self.llm.retry_delay,
+                "write_tool_model_name": self.llm.write_tool_model_name,
             },
             "prompt": {
                 "template_dir": self.prompt.template_dir,
@@ -306,6 +324,10 @@ class Config:
                 "num_diverse_programs": self.prompt.num_diverse_programs,
                 "use_template_stochasticity": self.prompt.use_template_stochasticity,
                 "template_variations": self.prompt.template_variations,
+                "session_max_tokens": self.prompt.session_max_tokens,
+                "session_compress_threshold": self.prompt.session_compress_threshold,
+                "recent_history_tokens": self.prompt.recent_history_tokens,
+                "compression_model_name": self.prompt.compression_model_name,
                 # Note: meta-prompting features not implemented
                 # "use_meta_prompting": self.prompt.use_meta_prompting,
                 # "meta_prompt_weight": self.prompt.meta_prompt_weight,
@@ -319,14 +341,16 @@ class Config:
                 "elite_selection_ratio": self.database.elite_selection_ratio,
                 "exploration_ratio": self.database.exploration_ratio,
                 "exploitation_ratio": self.database.exploitation_ratio,
-                # Note: diversity_metric fixed to "edit_distance"
-                # "diversity_metric": self.database.diversity_metric,
+                "root_commit": self.database.root_commit,
+                "git_repo_path": self.database.git_repo_path,
                 "feature_dimensions": self.database.feature_dimensions,
                 "feature_bins": self.database.feature_bins,
                 "migration_interval": self.database.migration_interval,
                 "migration_rate": self.database.migration_rate,
                 "random_seed": self.database.random_seed,
                 "log_prompts": self.database.log_prompts,
+                "evolution_target": self.database.evolution_target,
+                "signature_similarity_threshold": self.database.signature_similarity_threshold,
             },
             "evaluator": {
                 "timeout": self.evaluator.timeout,

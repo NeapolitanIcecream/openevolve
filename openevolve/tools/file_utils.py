@@ -52,11 +52,11 @@ def process_single_file_content(
             with open(file_path, "rb") as f:
                 encoded_content = base64.b64encode(f.read()).decode(DEFAULT_ENCODING)
             mime_type = get_specific_mime_type(file_path)
-            # This structure mimics the 'Part' object from the TS implementation
-            llm_content = {"inline_data": {"mime_type": mime_type, "data": encoded_content}}
+            # OpenAI 风格：将二进制以 data URI 字符串形式返回
+            data_uri = f"data:{mime_type};base64,{encoded_content}"
             return {
-                "llmContent": llm_content,
-                "returnDisplay": f"Read binary file: {os.path.relpath(file_path, root_dir)}",
+                "llmContent": data_uri,
+                "returnDisplay": f"Read binary file (as data URI): {os.path.relpath(file_path, root_dir)}",
             }
 
         # Handle text files

@@ -7,17 +7,16 @@ import json
 import logging
 import os
 import random
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field, fields
-
-# FileLock removed - no longer needed with threaded parallel processing
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 import numpy as np
 
 from openevolve.config import DatabaseConfig
-from openevolve.utils.code_utils import calculate_edit_distance
 from openevolve.utils.metrics_utils import safe_numeric_average
+from openevolve.utils.diff_utils import clean_diff, minhash_signature, minhash_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,12 @@ class Program:
 
     # Program identification
     id: str
-    code: str
+    # 提交标识 (不再保存完整代码文本)
+    commit_hash: str
+    # 新增：commit 信息及其 diff
+    prompt_diff: Optional[str] = None  # 带文件名的清洗 diff，供提示词
+    hash_diff: Optional[str] = None    # 彻底清洗后的 diff，用于 MinHash
+    minhash_signature: List[int] = field(default_factory=list)
     language: str = "python"
 
     # Evolution information
@@ -143,7 +147,7 @@ class ProgramDatabase:
             self.load(config.db_path)
 
         # Prompt log
-        self.prompts_by_program: Dict[str, Dict[str, Dict[str, str]]] = None
+        self.prompts_by_program: Dict[str, Dict[str, Dict[str, Union[str, List[str]]]]] = {}
 
         # Set random seed for reproducible sampling if specified
         if config.random_seed is not None:
@@ -157,9 +161,7 @@ class ProgramDatabase:
             {}
         )  # hash -> {"value": float, "timestamp": float}
         self.diversity_cache_size: int = 1000  # LRU cache size
-        self.diversity_reference_set: List[str] = (
-            []
-        )  # Reference program codes for consistent diversity
+        self.diversity_reference_set: List[List[int]] = []  # Reference signatures
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
@@ -178,7 +180,7 @@ class ProgramDatabase:
         logger.info(f"Initialized program database with {len(self.programs)} programs")
 
     def add(
-        self, program: Program, iteration: int = None, target_island: Optional[int] = None
+        self, program: Program, iteration: Optional[int] = None, target_island: Optional[int] = None
     ) -> str:
         """
         Add a program to the database
@@ -199,6 +201,24 @@ class ProgramDatabase:
             self.last_iteration = max(self.last_iteration, iteration)
 
         self.programs[program.id] = program
+
+        # Ensure MinHash signature exists when hash_diff is available
+        if program.hash_diff and not program.minhash_signature:
+            program.minhash_signature = minhash_signature(program.hash_diff)
+
+        # If no hash_diff yet but we do have a commit_hash, automatically compute diff
+        if not program.hash_diff and program.commit_hash:
+            try:
+                prompt_diff, hash_diff = self._get_diff_from_root(program.commit_hash)
+                # Only overwrite if still empty to respect external overrides
+                if not program.prompt_diff:
+                    program.prompt_diff = prompt_diff
+                program.hash_diff = hash_diff
+                program.minhash_signature = minhash_signature(hash_diff)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to generate diff for commit {program.commit_hash}: {e}"
+                )
 
         # Calculate feature coordinates for MAP-Elites
         feature_coords = self._calculate_feature_coords(program)
@@ -644,7 +664,7 @@ class ProgramDatabase:
         self,
         program: Program,
         base_path: Optional[str] = None,
-        prompts: Optional[Dict[str, Dict[str, str]]] = None,
+        prompts: Optional[Dict[str, Dict[str, Union[str, List[str]]]]] = None,
     ) -> None:
         """
         Save a program to disk
@@ -685,8 +705,13 @@ class ProgramDatabase:
 
         for dim in self.config.feature_dimensions:
             if dim == "complexity":
-                # Use code length as complexity measure
-                complexity = len(program.code)
+                # Use diff length as complexity measure when available
+                if program.hash_diff:
+                    complexity = len(program.hash_diff)
+                elif program.prompt_diff:
+                    complexity = len(program.prompt_diff)
+                else:
+                    complexity = 0
                 bin_idx = self._calculate_complexity_bin(complexity)
                 coords.append(bin_idx)
             elif dim == "diversity":
@@ -739,7 +764,7 @@ class ProgramDatabase:
         Calculate the bin index for a given complexity value using feature scaling.
 
         Args:
-            complexity: The complexity value (code length)
+            complexity: The complexity value (change lines)
 
         Returns:
             Bin index in range [0, self.feature_bins - 1]
@@ -1351,7 +1376,10 @@ class ProgramDatabase:
                     # Create a copy for migration (to avoid removing from source)
                     migrant_copy = Program(
                         id=f"{migrant.id}_migrant_{target_island}",
-                        code=migrant.code,
+                        commit_hash=migrant.commit_hash,
+                        prompt_diff=migrant.prompt_diff,
+                        hash_diff=migrant.hash_diff,
+                        minhash_signature=migrant.minhash_signature.copy(),
                         language=migrant.language,
                         parent_id=migrant.id,
                         generation=migrant.generation,
@@ -1536,7 +1564,10 @@ class ProgramDatabase:
                     break
 
                 # Use fast approximation instead of expensive edit distance
-                diversity = self._fast_code_diversity(prog1.code, prog2.code)
+                diversity = self._fast_code_diversity(
+                    prog1.minhash_signature,
+                    prog2.minhash_signature,
+                )
                 total_diversity += diversity
                 comparisons += 1
 
@@ -1545,33 +1576,11 @@ class ProgramDatabase:
 
         return total_diversity / max(1, comparisons)
 
-    def _fast_code_diversity(self, code1: str, code2: str) -> float:
-        """
-        Fast approximation of code diversity using simple metrics
-
-        Returns diversity score (higher = more diverse)
-        """
-        if code1 == code2:
+    def _fast_code_diversity(self, sig1: List[int], sig2: List[int]) -> float:
+        """Return diversity (1 - Jaccard similarity) between two MinHash signatures."""
+        if not sig1 or not sig2 or len(sig1) != len(sig2):
             return 0.0
-
-        # Length difference (scaled to reasonable range)
-        len1, len2 = len(code1), len(code2)
-        length_diff = abs(len1 - len2)
-
-        # Line count difference
-        lines1 = code1.count("\n")
-        lines2 = code2.count("\n")
-        line_diff = abs(lines1 - lines2)
-
-        # Simple character set difference
-        chars1 = set(code1)
-        chars2 = set(code2)
-        char_diff = len(chars1.symmetric_difference(chars2))
-
-        # Combine metrics (scaled to match original edit distance range)
-        diversity = length_diff * 0.1 + line_diff * 10 + char_diff * 0.5
-
-        return diversity
+        return 1.0 - minhash_similarity(sig1, sig2)
 
     def _get_cached_diversity(self, program: Program) -> float:
         """
@@ -1583,11 +1592,16 @@ class ProgramDatabase:
         Returns:
             Diversity score (cached or newly computed)
         """
-        code_hash = hash(program.code)
+        code_hash = hash(program.hash_diff or program.prompt_diff or "")
 
         # Check cache first
         if code_hash in self.diversity_cache:
             return self.diversity_cache[code_hash]["value"]
+
+        # Ensure program has MinHash signature
+        if not program.minhash_signature and (program.hash_diff or program.prompt_diff):
+            text_for_sig = program.hash_diff or program.prompt_diff
+            program.minhash_signature = minhash_signature(text_for_sig or "")
 
         # Update reference set if needed
         if (
@@ -1598,9 +1612,8 @@ class ProgramDatabase:
 
         # Compute diversity against reference set
         diversity_scores = []
-        for ref_code in self.diversity_reference_set:
-            if ref_code != program.code:  # Don't compare with itself
-                diversity_scores.append(self._fast_code_diversity(program.code, ref_code))
+        for ref_sig in self.diversity_reference_set:
+            diversity_scores.append(1.0 - minhash_similarity(program.minhash_signature, ref_sig))
 
         diversity = (
             sum(diversity_scores) / max(1, len(diversity_scores)) if diversity_scores else 0.0
@@ -1620,10 +1633,15 @@ class ProgramDatabase:
         all_programs = list(self.programs.values())
 
         if len(all_programs) <= self.diversity_reference_size:
-            self.diversity_reference_set = [p.code for p in all_programs]
+            sigs = []
+            for p in all_programs:
+                if not p.minhash_signature:
+                    p.minhash_signature = minhash_signature(p.hash_diff or p.prompt_diff or "")
+                sigs.append(p.minhash_signature)
+            self.diversity_reference_set = sigs
         else:
-            # Select programs with maximum diversity
-            selected = []
+            # Select programs with maximum diversity based on MinHash
+            selected: List[Program] = []
             remaining = all_programs.copy()
 
             # Start with a random program
@@ -1632,14 +1650,17 @@ class ProgramDatabase:
 
             # Greedily add programs that maximize diversity to selected set
             while len(selected) < self.diversity_reference_size and remaining:
-                max_diversity = -1
+                max_diversity = -1.0
                 best_idx = -1
 
                 for i, candidate in enumerate(remaining):
-                    # Calculate minimum diversity to selected programs
+                    if not candidate.minhash_signature:
+                        candidate.minhash_signature = minhash_signature(candidate.hash_diff or candidate.prompt_diff or "")
                     min_div = float("inf")
                     for selected_prog in selected:
-                        div = self._fast_code_diversity(candidate.code, selected_prog.code)
+                        if not selected_prog.minhash_signature:
+                            selected_prog.minhash_signature = minhash_signature(selected_prog.hash_diff or selected_prog.prompt_diff or "")
+                        div = 1.0 - minhash_similarity(candidate.minhash_signature, selected_prog.minhash_signature)
                         min_div = min(min_div, div)
 
                     if min_div > max_diversity:
@@ -1649,7 +1670,7 @@ class ProgramDatabase:
                 if best_idx >= 0:
                     selected.append(remaining.pop(best_idx))
 
-            self.diversity_reference_set = [p.code for p in selected]
+            self.diversity_reference_set = [p.minhash_signature for p in selected]
 
         logger.debug(
             f"Updated diversity reference set with {len(self.diversity_reference_set)} programs"
@@ -1692,7 +1713,9 @@ class ProgramDatabase:
         stats["max"] = max(stats["max"], value)
 
         # Keep recent values for more sophisticated scaling methods
-        stats["values"].append(value)
+        values_list: List[float] = cast(List[float], stats["values"])
+        values_list.append(value)
+        stats["values"] = values_list
         if len(stats["values"]) > 1000:  # Limit memory usage
             stats["values"] = stats["values"][-1000:]
 
@@ -1715,8 +1738,8 @@ class ProgramDatabase:
 
         if self.feature_scaling_method == "minmax":
             # Min-max normalization to [0, 1]
-            min_val = stats["min"]
-            max_val = stats["max"]
+            min_val = cast(float, stats["min"])
+            max_val = cast(float, stats["max"])
 
             if max_val == min_val:
                 return 0.5  # All values are the same
@@ -1726,7 +1749,7 @@ class ProgramDatabase:
 
         elif self.feature_scaling_method == "percentile":
             # Use percentile ranking
-            values = stats["values"]
+            values = cast(List[float], stats["values"])
             if not values:
                 return 0.5
 
@@ -1745,8 +1768,8 @@ class ProgramDatabase:
             return min(1.0, max(0.0, value))
 
         stats = self.feature_stats[feature_name]
-        min_val = stats["min"]
-        max_val = stats["max"]
+        min_val = cast(float, stats["min"])
+        max_val = cast(float, stats["max"])
 
         if max_val == min_val:
             return 0.5
@@ -1940,7 +1963,7 @@ class ProgramDatabase:
         self,
         program_id: str,
         template_key: str,
-        prompt: Dict[str, str],
+        prompt: Dict[str, Union[str, List[str]]],
         responses: Optional[List[str]] = None,
     ) -> None:
         """
@@ -1959,7 +1982,7 @@ class ProgramDatabase:
 
         if responses is None:
             responses = []
-        prompt["responses"] = responses
+        prompt["responses"] = responses  # type: ignore[index]
 
         if self.prompts_by_program is None:
             self.prompts_by_program = {}
@@ -1967,3 +1990,41 @@ class ProgramDatabase:
         if program_id not in self.prompts_by_program:
             self.prompts_by_program[program_id] = {}
         self.prompts_by_program[program_id][template_key] = prompt
+
+    # ---------------- Git helpers ----------------
+
+    def _get_diff_from_root(self, commit_hash: str):
+        """Return (prompt_diff, hash_diff) between root_commit and *commit_hash*.
+
+        Uses `git diff` under the hood and falls back to empty strings if diff fails.
+        """
+        root = getattr(self.config, "root_commit", "HEAD")
+        repo_path = getattr(self.config, "git_repo_path", ".")
+
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_path,
+                    "diff",
+                    "--binary",
+                    "--no-color",
+                    root,
+                    commit_hash,
+                    "--",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            raw_diff = result.stdout or ""
+        except FileNotFoundError:
+            logger.error("git executable not found – cannot compute commit diff")
+            return "", ""
+        except Exception as exc:
+            logger.warning(f"git diff invocation failed: {exc}")
+            return "", ""
+
+        return clean_diff(raw_diff)

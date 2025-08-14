@@ -1,13 +1,21 @@
 """
-Process-based parallel controller for true parallelism
+Process-based parallel controller for true parallelism (commit-based evolution)
+
+This controller allocates dedicated git worktrees to worker processes so that
+each iteration can safely modify the repository state in parallel and create a
+commit. The database derives diffs and MinHash signatures from commit hashes.
 """
 
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import pickle
 import signal
+import subprocess
 import time
+import json
+import uuid
 from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -15,6 +23,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
+from openevolve.evaluator import Evaluator
+from openevolve.tools.registry import ToolRegistry
+from openevolve.llm.openai import OpenAILLM
+from openevolve.llm.session import ConversationSession
 
 logger = logging.getLogger(__name__)
 
@@ -25,20 +37,76 @@ class SerializableResult:
     child_program_dict: Optional[Dict[str, Any]] = None
     parent_id: Optional[str] = None
     iteration_time: float = 0.0
-    prompt: Optional[Dict[str, str]] = None
-    llm_response: Optional[str] = None
     artifacts: Optional[Dict[str, Any]] = None
     iteration: int = 0
     error: Optional[str] = None
 
 
+class WorktreePool:
+    """Pre-create and manage a fixed number of git worktrees for parallel workers."""
+
+    def __init__(self, repo_path: str, base_commit: str, pool_size: int) -> None:
+        self.repo_path = os.path.abspath(repo_path)
+        self.base_commit = base_commit
+        self.pool_size = max(1, pool_size)
+        self.base_dir = os.path.join(self.repo_path, ".openevolve", "worktrees")
+        os.makedirs(self.base_dir, exist_ok=True)
+
+        # Reduce lock contention and ensure commits work without relying on global config
+        self._git_repo(["config", "gc.auto", "0"], check=False)
+        self._git_repo(["config", "user.name", "OpenEvolve"], check=False)
+        self._git_repo(["config", "user.email", "openevolve@example.com"], check=False)
+
+        self.slots: List[str] = []
+        self._in_use: Dict[str, bool] = {}
+
+        for i in range(self.pool_size):
+            wt_dir = os.path.join(self.base_dir, f"wk_{i}")
+            if not os.path.exists(os.path.join(wt_dir, ".git")):
+                self._create_worktree(wt_dir)
+            self.slots.append(wt_dir)
+            self._in_use[wt_dir] = False
+
+        logger.info(
+            f"WorktreePool initialized with {len(self.slots)} worktrees under {self.base_dir}"
+        )
+
+    def _git_repo(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+        proc = subprocess.run(["git", "-C", self.repo_path, *args], capture_output=True, text=True)
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr or proc.stdout}")
+        return proc
+
+    def _create_worktree(self, wt_dir: str) -> None:
+        os.makedirs(os.path.dirname(wt_dir), exist_ok=True)
+        proc = self._git_repo(["worktree", "add", "--detach", wt_dir, self.base_commit])
+        if proc.returncode != 0:
+            raise RuntimeError(f"failed to create worktree {wt_dir}: {proc.stderr}")
+        logger.debug(f"Created worktree {wt_dir} at {self.base_commit}")
+
+    def acquire(self) -> Optional[str]:
+        for wt in self.slots:
+            if not self._in_use[wt]:
+                self._in_use[wt] = True
+                return wt
+        return None
+
+    def release(self, wt_dir: str) -> None:
+        if wt_dir in self._in_use:
+            self._in_use[wt_dir] = False
+        else:
+            logger.warning(f"Release called on unknown worktree {wt_dir}")
+
 def _worker_init(config_dict: dict, evaluation_file: str) -> None:
-    """Initialize worker process with necessary components"""
+    """Initialize worker process with necessary components (commit-based)."""
     global _worker_config
     global _worker_evaluation_file
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_registry
+    global _worker_llm
+    global _worker_session
     
     # Store config for later use
     # Reconstruct Config object from nested dictionaries
@@ -71,8 +139,25 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     
     # These will be lazily initialized on first use
     _worker_evaluator = None
-    _worker_llm_ensemble = None  
+    _worker_llm_ensemble = None
     _worker_prompt_sampler = None
+    _worker_registry = None
+    _worker_llm = None
+
+    # 统一的会话管理（OpenAI 兼容历史）
+    _worker_session = ConversationSession(
+        system_message=(
+            "You are an expert software agent operating inside a git worktree. "
+            "Use the tools to read files, make minimal safe edits, and finally call 'evaluate' once to finish an iteration. "
+            "Always use absolute paths under the provided root, avoid destructive changes, and keep edits consistent."
+        )
+    )
+
+    # Initialize repo-level evaluator for this worker
+    try:
+        _worker_evaluator = Evaluator(evaluator_config, evaluation_file)
+    except Exception as e:
+        logger.warning(f"Failed to initialize Evaluator in worker: {e}")
 
 
 def _lazy_init_worker_components():
@@ -80,168 +165,154 @@ def _lazy_init_worker_components():
     global _worker_evaluator
     global _worker_llm_ensemble
     global _worker_prompt_sampler
+    global _worker_registry
+    global _worker_llm
+    global _worker_session
     
     if _worker_llm_ensemble is None:
         from openevolve.llm.ensemble import LLMEnsemble
         _worker_llm_ensemble = LLMEnsemble(_worker_config.llm.models)
-    
+
     if _worker_prompt_sampler is None:
         from openevolve.prompt.sampler import PromptSampler
         _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
-    
+
     if _worker_evaluator is None:
         from openevolve.evaluator import Evaluator
-        from openevolve.llm.ensemble import LLMEnsemble
-        from openevolve.prompt.sampler import PromptSampler
-        
-        # Create evaluator-specific components
-        evaluator_llm = LLMEnsemble(_worker_config.llm.evaluator_models)
-        evaluator_prompt = PromptSampler(_worker_config.prompt)
-        evaluator_prompt.set_templates("evaluator_system_message")
-        
         _worker_evaluator = Evaluator(
             _worker_config.evaluator,
             _worker_evaluation_file,
-            evaluator_llm,
-            evaluator_prompt,
-            database=None  # No shared database in worker
+            database=None,
         )
+
+    # 单例 ToolRegistry 与 LLM（禁用内部历史记录）
+    if _worker_registry is None:
+        from openevolve.tools.registry import ToolRegistry
+        _worker_registry = ToolRegistry(config={"root_dir": _worker_config.database.git_repo_path}, evaluator=_worker_evaluator)
+
+    if _worker_llm is None:
+        # 选择写工具模型；若未指定则使用第一个模型
+        model_cfg = None
+        desired = getattr(_worker_config.llm, "write_tool_model_name", None)
+        if desired:
+            for m in _worker_config.llm.models:
+                if m.name == desired:
+                    model_cfg = m
+                    break
+        if model_cfg is None:
+            model_cfg = _worker_config.llm.models[0]
+        _worker_llm = OpenAILLM(model_cfg, tool_registry=_worker_registry)
+        # 绑定统一会话
+        _worker_llm.attach_session(_worker_session)
+        # 注册写文件工具
+        _worker_registry.set_llm_client(_worker_llm)
 
 
 def _run_iteration_worker(
     iteration: int,
     db_snapshot: Dict[str, Any],
     parent_id: str,
-    inspiration_ids: List[str]
+    inspiration_ids: List[str],
+    worktree_dir: str,
+    branch_name: str,
+    parent_commit: str,
+    iteration_context: str,
 ) -> SerializableResult:
-    """Run a single iteration in a worker process"""
+    """Run a single iteration in a worker process (commit-based)."""
     try:
         # Lazy initialization
         _lazy_init_worker_components()
-        
+
         # Reconstruct programs from snapshot
         programs = {
             pid: Program(**prog_dict) 
-            for pid, prog_dict in db_snapshot["programs"].items()
+            for pid, prog_dict in db_snapshot.get("programs", {}).items()
         }
         
         parent = programs[parent_id]
-        inspirations = [programs[pid] for pid in inspiration_ids if pid in programs]
-        
-        # Get parent artifacts if available
-        parent_artifacts = db_snapshot["artifacts"].get(parent_id)
-        
-        # Get island-specific programs for context
-        parent_island = parent.metadata.get("island", db_snapshot["current_island"])
-        island_programs = [
-            programs[pid] for pid in db_snapshot["islands"][parent_island]
-            if pid in programs
-        ]
-        
-        # Sort by metrics for top programs
-        from openevolve.utils.metrics_utils import safe_numeric_average
-        island_programs.sort(
-            key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
-            reverse=True
-        )
-        
-        # Use config values for limits instead of hardcoding
-        island_top_programs = island_programs[:_worker_config.prompt.num_top_programs + _worker_config.prompt.num_diverse_programs]
-        island_previous_programs = island_programs[:_worker_config.prompt.num_top_programs]
-        
-        # Build prompt
-        prompt = _worker_prompt_sampler.build_prompt(
-            current_program=parent.code,
-            parent_program=parent.code,
-            program_metrics=parent.metrics,
-            previous_programs=[p.to_dict() for p in island_previous_programs],
-            top_programs=[p.to_dict() for p in island_top_programs],
-            inspirations=[p.to_dict() for p in inspirations],
-            language=_worker_config.language,
-            evolution_round=iteration,
-            diff_based_evolution=_worker_config.diff_based_evolution,
-            program_artifacts=parent_artifacts,
-        )
-        
+
+        # Start timer
         iteration_start = time.time()
-        
-        # Generate code modification (sync wrapper for async)
-        llm_response = asyncio.run(
-            _worker_llm_ensemble.generate_with_context(
-                system_message=prompt["system"],
-                messages=[{"role": "user", "content": prompt["user"]}],
+
+        # Git helpers scoped to worktree
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", worktree_dir, *args], capture_output=True, text=True)
+
+        # Ensure clean working tree
+        git("reset", "--hard")
+        git("clean", "-fd")
+
+        # Checkout unique branch at parent commit
+        proc = git("checkout", "-B", branch_name, parent_commit)
+        if proc.returncode != 0:
+            return SerializableResult(error=f"git checkout failed: {proc.stderr}", iteration=iteration)
+
+        # ---- LLM + Tools loop (multi-iteration session) ----
+        # 绑定本迭代的根目录到 registry（更新 root_dir）
+        assert _worker_registry is not None, "ToolRegistry is not initialized"
+        assert _worker_llm is not None, "LLM is not initialized"
+        if hasattr(_worker_registry, "tool_config"):
+            _worker_registry.tool_config.root_dir = worktree_dir  # type: ignore[attr-defined]
+        if hasattr(_worker_registry, "config"):
+            _worker_registry.config["root_dir"] = worktree_dir  # type: ignore[index]
+
+        # 由 LLM 层执行完整的工具循环并维护历史
+        run_out: Dict[str, Any] = asyncio.run(
+            _worker_llm.run_iteration_with_tools(
+                iteration=iteration,
+                parent_commit=parent_commit,
+                iteration_context=iteration_context,
+                prompt_cfg=_worker_config.prompt,
+                max_steps=30,
             )
         )
-        
-        # Parse response based on evolution mode
-        if _worker_config.diff_based_evolution:
-            from openevolve.utils.code_utils import extract_diffs, apply_diff, format_diff_summary
-            
-            diff_blocks = extract_diffs(llm_response)
-            if not diff_blocks:
-                return SerializableResult(
-                    error=f"No valid diffs found in response",
-                    iteration=iteration
-                )
-            
-            child_code = apply_diff(parent.code, llm_response)
-            changes_summary = format_diff_summary(diff_blocks)
-        else:
-            from openevolve.utils.code_utils import parse_full_rewrite
-            
-            new_code = parse_full_rewrite(llm_response, _worker_config.language)
-            if not new_code:
-                return SerializableResult(
-                    error=f"No valid code found in response",
-                    iteration=iteration
-                )
-            
-            child_code = new_code
-            changes_summary = "Full rewrite"
-        
-        # Check code length
-        if len(child_code) > _worker_config.max_code_length:
-            return SerializableResult(
-                error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
-                iteration=iteration
-            )
-        
-        # Evaluate the child program
-        import uuid
-        child_id = str(uuid.uuid4())
-        child_metrics = asyncio.run(
-            _worker_evaluator.evaluate_program(child_code, child_id)
+        metrics: Dict[str, Any] = run_out.get("metrics") or {}
+        did_evaluate: bool = bool(run_out.get("did_evaluate"))
+
+        # 仅当 evaluate 被触发后才提交
+        if not did_evaluate:
+            return SerializableResult(error="Iteration ended without calling evaluate tool", iteration=iteration)
+
+        commit_suffix = " ".join(
+            [f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}" for k, v in (metrics or {}).items()][:6]
         )
-        
-        # Get artifacts
-        artifacts = _worker_evaluator.get_pending_artifacts(child_id)
-        
-        # Create child program
+        commit_msg = f"OpenEvolve iteration {iteration} {commit_suffix}".strip()
+        git("add", "-A")
+        proc = git("commit", "--allow-empty", "-m", commit_msg)
+        if proc.returncode != 0:
+            return SerializableResult(error=f"git commit failed: {proc.stderr}", iteration=iteration)
+
+        # Get commit hash
+        proc = git("rev-parse", "HEAD")
+        if proc.returncode != 0:
+            return SerializableResult(error=f"git rev-parse failed: {proc.stderr}", iteration=iteration)
+        child_hash = proc.stdout.strip()
+
+        # Create child program (DB will compute diffs/signatures)
         child_program = Program(
-            id=child_id,
-            code=child_code,
-            language=_worker_config.language,
+            id=str(uuid.uuid4()),
+            commit_hash=child_hash,
             parent_id=parent.id,
             generation=parent.generation + 1,
-            metrics=child_metrics,
+            metrics=metrics or {},
             iteration_found=iteration,
+            language=getattr(_worker_config, "language", "python") or "python",
             metadata={
-                "changes": changes_summary,
-                "parent_metrics": parent.metrics,
-                "island": parent_island,
-            }
+                "branch": branch_name,
+                "parent_commit": parent_commit,
+            },
         )
         
         iteration_time = time.time() - iteration_start
+
+        # 会话压缩已在 LLM 层按需执行
         
         return SerializableResult(
             child_program_dict=child_program.to_dict(),
             parent_id=parent.id,
             iteration_time=iteration_time,
-            prompt=prompt,
-            llm_response=llm_response,
-            artifacts=artifacts,
-            iteration=iteration
+            artifacts=None,
+            iteration=iteration,
         )
         
     except Exception as e:
@@ -265,6 +336,7 @@ class ProcessParallelController:
         
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
+        self._worktree_assignments: Dict[int, str] = {}
         
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
     
@@ -283,6 +355,7 @@ class ProcessParallelController:
                 'timeout': config.llm.timeout,
                 'retries': config.llm.retries,
                 'retry_delay': config.llm.retry_delay,
+                'write_tool_model_name': getattr(config.llm, 'write_tool_model_name', None),
             },
             'prompt': asdict(config.prompt),
             'database': asdict(config.database),
@@ -302,6 +375,13 @@ class ProcessParallelController:
         # Convert config to dict for pickling
         # We need to be careful with nested dataclasses
         config_dict = self._serialize_config(self.config)
+        
+        # Initialize a worktree pool sized to the number of workers
+        self.worktree_pool = WorktreePool(
+            repo_path=self.config.database.git_repo_path,
+            base_commit=self.config.database.root_commit,
+            pool_size=max(1, self.num_workers),
+        )
         
         # Create process pool with initializer
         self.executor = ProcessPoolExecutor(
@@ -366,6 +446,8 @@ class ProcessParallelController:
         """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
+        if not hasattr(self, 'worktree_pool') or self.worktree_pool is None:
+            raise RuntimeError("Worktree pool not initialized")
         
         total_iterations = start_iteration + max_iterations
         
@@ -376,6 +458,7 @@ class ProcessParallelController:
         
         # Track pending futures
         pending_futures: Dict[int, Future] = {}
+        deferred_iterations: List[int] = []  # iterations that failed to submit due to capacity and should be retried
         batch_size = min(self.num_workers * 2, max_iterations)
         
         # Submit initial batch
@@ -383,9 +466,13 @@ class ProcessParallelController:
             future = self._submit_iteration(i)
             if future:
                 pending_futures[i] = future
+            else:
+                # Keep the iteration number for later retry when a worktree frees up
+                deferred_iterations.append(i)
         
         next_iteration = start_iteration + batch_size
         completed_iterations = 0
+        stop_requested = False
         
         # Island management
         programs_per_island = max(1, max_iterations // (self.config.database.num_islands * 10))
@@ -427,18 +514,7 @@ class ProcessParallelController:
                     if result.artifacts:
                         self.database.store_artifacts(child_program.id, result.artifacts)
                     
-                    # Log prompts
-                    if result.prompt:
-                        self.database.log_prompt(
-                            template_key=(
-                                "full_rewrite_user" 
-                                if not self.config.diff_based_evolution 
-                                else "diff_user"
-                            ),
-                            program_id=child_program.id,
-                            prompt=result.prompt,
-                            responses=[result.llm_response] if result.llm_response else []
-                        )
+                    # Prompt logging not used in commit-based scaffold
                     
                     # Island management
                     if completed_iteration > start_iteration and current_island_counter >= programs_per_island:
@@ -512,38 +588,88 @@ class ProcessParallelController:
                                 logger.info(
                                     f"Target score {target_score} reached at iteration {completed_iteration}"
                                 )
-                                break
+                                # Defer loop break until after we release resources
+                                stop_requested = True
                 
             except Exception as e:
                 logger.error(f"Error processing result from iteration {completed_iteration}: {e}")
             
+            # Release any worktree assigned to the completed iteration ASAP to improve throughput
+            if completed_iteration in self._worktree_assignments:
+                wt_dir = self._worktree_assignments.pop(completed_iteration)
+                if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
+                    self.worktree_pool.release(wt_dir)
+
             completed_iterations += 1
-            
-            # Submit next iteration
+
+            # If early stop requested, break after releasing resources
+            if stop_requested:
+                break
+
+            # Try to submit deferred iterations first (retry those that previously failed due to capacity)
+            while deferred_iterations and not self.shutdown_event.is_set():
+                retry_it = deferred_iterations[0]
+                fut_retry = self._submit_iteration(retry_it)
+                if fut_retry:
+                    pending_futures[retry_it] = fut_retry
+                    deferred_iterations.pop(0)
+                else:
+                    # No capacity yet; try later
+                    break
+
+            # Submit next iteration (append to deferred if capacity unavailable)
             if next_iteration < total_iterations and not self.shutdown_event.is_set():
-                future = self._submit_iteration(next_iteration)
-                if future:
-                    pending_futures[next_iteration] = future
-                    next_iteration += 1
+                fut_next = self._submit_iteration(next_iteration)
+                if fut_next:
+                    pending_futures[next_iteration] = fut_next
+                else:
+                    deferred_iterations.append(next_iteration)
+                next_iteration += 1
         
-        # Handle shutdown
-        if self.shutdown_event.is_set():
-            logger.info("Shutdown requested, canceling remaining evaluations...")
+        # Cancel any remaining evaluations (shutdown or early stop or natural end)
+        if pending_futures:
+            if self.shutdown_event.is_set():
+                logger.info("Shutdown requested, canceling remaining evaluations...")
+            else:
+                logger.info("Canceling remaining evaluations...")
             for future in pending_futures.values():
                 future.cancel()
-        
+
+        # Release any worktrees still assigned to in-flight or canceled iterations
+        if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
+            for it, wt_dir in list(self._worktree_assignments.items()):
+                try:
+                    self.worktree_pool.release(wt_dir)
+                except Exception:
+                    pass
+                finally:
+                    self._worktree_assignments.pop(it, None)
+
         logger.info("Evolution completed")
         
         return self.database.get_best_program()
     
     def _submit_iteration(self, iteration: int) -> Optional[Future]:
-        """Submit an iteration to the process pool"""
+        """Submit an iteration to the process pool (commit-based)."""
+        worktree_dir: Optional[str] = None
         try:
+            # Avoid scheduling when executor not available or shutting down
+            if self.executor is None or self.shutdown_event.is_set():
+                return None
+
             # Sample parent and inspirations
             parent, inspirations = self.database.sample()
             
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
+            
+            # Acquire a dedicated worktree for this iteration
+            worktree_dir = self.worktree_pool.acquire()
+            if not worktree_dir:
+                logger.warning("No available worktree to schedule iteration; delaying submission")
+                return None
+            branch_name = f"oe/it_{iteration}_{uuid.uuid4().hex[:8]}"
+            parent_commit = parent.commit_hash
             
             # Submit to process pool
             future = self.executor.submit(
@@ -551,11 +677,41 @@ class ProcessParallelController:
                 iteration,
                 db_snapshot,
                 parent.id,
-                [insp.id for insp in inspirations]
+                [insp.id for insp in inspirations],
+                worktree_dir,
+                branch_name,
+                parent_commit,
+                self._build_iteration_context(parent, inspirations),
             )
+            
+            self._worktree_assignments[iteration] = worktree_dir
             
             return future
             
         except Exception as e:
             logger.error(f"Error submitting iteration {iteration}: {e}")
+            # Ensure we release any acquired worktree on failure
+            try:
+                if worktree_dir:
+                    if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
+                        self.worktree_pool.release(worktree_dir)
+            except Exception:
+                pass
             return None
+
+    def _build_iteration_context(self, parent: Program, inspirations: List[Program]) -> str:
+        """Build a simple textual context for the worker's LLM session."""
+        parts: List[str] = []
+        target = getattr(self.config.database, "evolution_target", None)
+        if target:
+            parts.append(f"Goal: {target}")
+        if getattr(parent, "prompt_diff", None):
+            parts.append("Parent changes (root→parent):\n" + (parent.prompt_diff or ""))
+        count = 0
+        for insp in inspirations:
+            if getattr(insp, "prompt_diff", None):
+                parts.append("Inspiration (root→commit):\n" + (insp.prompt_diff or ""))
+                count += 1
+                if count >= 2:
+                    break
+        return "\n\n".join(parts)

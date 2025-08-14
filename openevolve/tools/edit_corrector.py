@@ -1,7 +1,5 @@
-
 '''
-Contains the logic for correcting edit tool parameters, mirroring the functionality
-of the TypeScript editCorrector.ts.
+Contains the logic for correcting edit tool parameters.
 '''
 
 import asyncio
@@ -97,46 +95,77 @@ def get_timestamp_from_function_id(fcn_id: str) -> int:
     return -1
 
 async def find_last_edit_timestamp(file_path: str, client: LLMInterface) -> int:
-    '''Finds the timestamp of the last tool interaction with a file.'''
+    """Find timestamp of the last relevant tool interaction with a file (OpenAI style).
+
+    Expectations for history entries (OpenAI Chat API compatible):
+      - Assistant tool call message:
+        {
+          "role": "assistant",
+          "content": None | str,
+          "tool_calls": [
+            {"id": str, "type": "function", "function": {"name": str, "arguments": str}}
+          ]
+        }
+      - Tool response message:
+        {
+          "role": "tool",
+          "tool_call_id": str,
+          "name": str,
+          "content": str
+        }
+
+    We prefer timestamps on entries via keys like "created"/"timestamp" (seconds or ms).
+    If absent, we cannot recover time and will return -1.
+    """
     history = await client.get_history() or []
-    
-    tools_in_resp = {"write_file", "replace", "read_many_files", "grep"}
-    tools_in_call = tools_in_resp.union({"read_file"})
 
+    # Define tool names of interest. We prioritize write operations.
+    tools_in_response = {"edit"}
+    tools_in_call = {"edit", "read_file", "read_many_files"}
+
+    def _extract_ts(entry: Dict[str, Any]) -> Optional[int]:
+        ts = entry.get("created") or entry.get("timestamp") or entry.get("created_at")
+        if isinstance(ts, (int, float)):
+            ts_int = int(ts)
+            # Normalize to milliseconds
+            return ts_int if ts_int > 10_000_000_000 else ts_int * 1000
+        return None
+
+    last_ts: int = -1
+
+    # Scan newest to oldest
     for entry in reversed(history):
-        parts = entry.get('parts', [])
-        if not parts:
-            continue
+        role = entry.get("role")
+        if role == "assistant" and isinstance(entry.get("tool_calls"), list):
+            for tc in entry["tool_calls"]:
+                try:
+                    f_id = tc.get("id")
+                    fn = (tc.get("function") or {})
+                    name = (fn.get("name") or "").strip()
+                    args = fn.get("arguments")
+                except Exception:
+                    continue
+                if name not in tools_in_call:
+                    continue
+                # arguments is typically a JSON string
+                arg_text = args if isinstance(args, str) else json.dumps(args or {})
+                if file_path and file_path in arg_text:
+                    ts = _extract_ts(entry)
+                    if ts is not None:
+                        last_ts = max(last_ts, ts)
 
-        for part in parts:
-            f_id: Optional[str] = None
-            content: Any = None
-
-            if entry.get('role') == 'model' and 'functionCall' in part:
-                f_call = part['functionCall']
-                if f_call.get('name') in tools_in_call:
-                    f_id = f_call.get('id')
-                    content = f_call.get('args')
-            elif entry.get('role') == 'user' and 'functionResponse' in part:
-                f_resp = part['functionResponse']
-                if f_resp.get('name') in tools_in_resp:
-                    response = f_resp.get('response', {})
-                    if response and 'output' in response and 'error' not in response:
-                        f_id = f_resp.get('id')
-                        content = response['output']
-
-            if not f_id or content is None:
+        elif role == "tool":
+            name = (entry.get("name") or "").strip()
+            if name not in tools_in_response:
                 continue
+            content = entry.get("content")
+            content_text = content if isinstance(content, str) else json.dumps(content or {})
+            if file_path and file_path in content_text:
+                ts = _extract_ts(entry)
+                if ts is not None:
+                    last_ts = max(last_ts, ts)
 
-            stringified_content = json.dumps(content)
-            if (
-                "Error" not in stringified_content and
-                "Failed" not in stringified_content and
-                file_path in stringified_content
-            ):
-                return get_timestamp_from_function_id(f_id)
-
-    return -1
+    return last_ts
 
 # --- LLM Correction Logic --- #
 
@@ -201,10 +230,15 @@ File content:
 Return ONLY the corrected target snippet in the specified JSON format with the key 'corrected_target_snippet'. If no clear, unique match can be found, return an empty string for 'corrected_target_snippet'.
     '''.strip()
     try:
-        result = await client.generate_json(
-            prompt, OLD_STRING_CORRECTION_SCHEMA
+        out = await client.invoke(
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": OLD_STRING_CORRECTION_SCHEMA},
+            },
         )
-        if result and isinstance(result.get('corrected_target_snippet'), str) and result['corrected_target_snippet']:
+        result = out.json or {}
+        if isinstance(result.get('corrected_target_snippet'), str) and result['corrected_target_snippet']:
             return result['corrected_target_snippet']
     except Exception as e:
         if abort_signal.is_set(): raise
@@ -235,10 +269,15 @@ Task: Generate an updated `new_string` that is a suitable replacement for the `c
 Return ONLY the corrected `new_string` in the specified JSON format with the key 'corrected_new_string'.
     '''.strip()
     try:
-        result = await client.generate_json(
-            prompt, NEW_STRING_CORRECTION_SCHEMA
+        out = await client.invoke(
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": NEW_STRING_CORRECTION_SCHEMA},
+            },
         )
-        if result and isinstance(result.get('corrected_new_string'), str) and result['corrected_new_string']:
+        result = out.json or {}
+        if isinstance(result.get('corrected_new_string'), str) and result['corrected_new_string']:
             return result['corrected_new_string']
     except Exception as e:
         if abort_signal.is_set(): raise
@@ -265,8 +304,15 @@ Task: Analyze the `potentially_problematic_new_string`. If it's syntactically in
 Return ONLY the corrected string in the specified JSON format with the key 'corrected_new_string_escaping'. If no escaping correction is needed, return the original `potentially_problematic_new_string`.
     '''.strip()
     try:
-        result = await client.generate_json(prompt, CORRECT_NEW_STRING_ESCAPING_SCHEMA)
-        if result and isinstance(result.get('corrected_new_string_escaping'), str) and result['corrected_new_string_escaping']:
+        out = await client.invoke(
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": CORRECT_NEW_STRING_ESCAPING_SCHEMA},
+            },
+        )
+        result = out.json or {}
+        if isinstance(result.get('corrected_new_string_escaping'), str) and result['corrected_new_string_escaping']:
             return result['corrected_new_string_escaping']
     except Exception as e:
         if abort_signal.is_set(): raise
@@ -288,8 +334,15 @@ Task: Analyze the `potentially_problematic_string`. If it's syntactically invali
 Return ONLY the corrected string in the specified JSON format with the key 'corrected_string_escaping'. If no escaping correction is needed, return the original `potentially_problematic_string`.
     '''.strip()
     try:
-        result = await client.generate_json(prompt, CORRECT_STRING_ESCAPING_SCHEMA)
-        if result and isinstance(result.get('corrected_string_escaping'), str) and result['corrected_string_escaping']:
+        out = await client.invoke(
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": CORRECT_STRING_ESCAPING_SCHEMA},
+            },
+        )
+        result = out.json or {}
+        if isinstance(result.get('corrected_string_escaping'), str) and result['corrected_string_escaping']:
             return result['corrected_string_escaping']
     except Exception as e:
         if abort_signal.is_set(): raise
