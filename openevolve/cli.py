@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from typing import Dict, List, Optional
+from openevolve.utils.git_utils import ensure_repo
 
 from openevolve import OpenEvolve
 from openevolve.config import Config, load_config
@@ -87,8 +88,10 @@ async def main_async() -> int:
     if not os.path.exists(args.git_repo) or not os.path.isdir(args.git_repo):
         print(f"Error: Repository path '{args.git_repo}' not found or not a directory")
         return 1
-    if not os.path.exists(os.path.join(args.git_repo, ".git")):
-        print(f"Error: Path '{args.git_repo}' is not a git repository (missing .git)")
+    try:
+        ensure_repo(args.git_repo)
+    except Exception:
+        print(f"Error: Path '{args.git_repo}' is not a git repository")
         return 1
 
     if not os.path.exists(args.evaluation_file):
@@ -119,16 +122,24 @@ async def main_async() -> int:
 
         # ---- LLM-related overrides ----
         if args.api_base:
-            config.llm.api_base = args.api_base
-            print(f"Using API base: {config.llm.api_base}")
+            config.llm.update_model_params({"api_base": args.api_base}, overwrite=True)
+            print(f"Using API base: {args.api_base}")
 
         if args.primary_model:
-            config.llm.primary_model = args.primary_model
-            print(f"Using primary model: {config.llm.primary_model}")
+            if config.llm.models:
+                config.llm.models[0].name = args.primary_model
+            else:
+                from openevolve.config import LLMModelConfig
+                config.llm.models = [LLMModelConfig(name=args.primary_model, weight=1.0)]
+            print(f"Using primary model: {args.primary_model}")
 
         if args.secondary_model:
-            config.llm.secondary_model = args.secondary_model
-            print(f"Using secondary model: {config.llm.secondary_model}")
+            from openevolve.config import LLMModelConfig
+            if len(config.llm.models) < 2:
+                config.llm.models.append(LLMModelConfig(name=args.secondary_model, weight=0.5))
+            else:
+                config.llm.models[1].name = args.secondary_model
+            print(f"Using secondary model: {args.secondary_model}")
 
         if args.write_tool_model:
             config.llm.write_tool_model_name = args.write_tool_model

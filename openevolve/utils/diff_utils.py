@@ -77,9 +77,9 @@ def clean_diff(raw_diff: str) -> Tuple[str, str]:
 
 try:
     from datasketch import MinHash as _DSMinHash
-
     _HAS_DATASKETCH = True
-except ImportError:  # Fallback for environments without datasketch
+except Exception:  # Fallback for environments without datasketch or partial import failures
+    _DSMinHash = None  # type: ignore[assignment]
     _HAS_DATASKETCH = False
 
 
@@ -94,17 +94,19 @@ def _shingles(text: str, shingle_len: int = _SHINGLE_LEN) -> List[str]:
     return [text[i : i + shingle_len] for i in range(0, len(text) - shingle_len + 1)]
 
 
-def _minhash_signature_datasketch(text: str, num_perm: int = _DEF_NUM_PERM) -> List[int]:
+def _minhash_signature_datasketch(text: str, num_perm: int = _DEF_NUM_PERM, *, shingle_len: int = _SHINGLE_LEN) -> List[int]:
+    if not _HAS_DATASKETCH or _DSMinHash is None:  # Defensive guard for type checkers
+        return _minhash_signature_simple(text, num_perm=num_perm, shingle_len=shingle_len)
     m = _DSMinHash(num_perm=num_perm)
-    for token in _shingles(text):
+    for token in _shingles(text, shingle_len=shingle_len):
         m.update(token.encode("utf-8"))
     return list(m.hashvalues)
 
 
-def _minhash_signature_simple(text: str, num_perm: int = _DEF_NUM_PERM) -> List[int]:
+def _minhash_signature_simple(text: str, num_perm: int = _DEF_NUM_PERM, *, shingle_len: int = _SHINGLE_LEN) -> List[int]:
     """Lightweight pure-Python MinHash (fallback)."""
     sig = []
-    tokens = _shingles(text)
+    tokens = _shingles(text, shingle_len=shingle_len)
     if not tokens:
         return [0] * num_perm
     for i in range(num_perm):
@@ -115,14 +117,14 @@ def _minhash_signature_simple(text: str, num_perm: int = _DEF_NUM_PERM) -> List[
 
 # Public API
 
-def minhash_signature(text: str, num_perm: int = _DEF_NUM_PERM) -> List[int]:
+def minhash_signature(text: str, num_perm: int = _DEF_NUM_PERM, *, shingle_len: int = _SHINGLE_LEN) -> List[int]:
     """Generate MinHash signature for *text*.
 
     Uses `datasketch` when available, otherwise falls back to a pure-Python version.
     """
     if _HAS_DATASKETCH:
-        return _minhash_signature_datasketch(text, num_perm=num_perm)
-    return _minhash_signature_simple(text, num_perm=num_perm)
+        return _minhash_signature_datasketch(text, num_perm=num_perm, shingle_len=shingle_len)
+    return _minhash_signature_simple(text, num_perm=num_perm, shingle_len=shingle_len)
 
 
 def minhash_similarity(sig_a: List[int], sig_b: List[int]) -> float:

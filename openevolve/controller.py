@@ -17,6 +17,7 @@ from openevolve.process_parallel import ProcessParallelController
 from openevolve.utils.format_utils import (
     format_metrics_safe,
 )
+from openevolve.utils.git_utils import ensure_repo, ref_exists
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,6 @@ class OpenEvolve:
             base_seed = str(self.config.random_seed).encode("utf-8")
             llm_seed = int(hashlib.md5(base_seed + b"llm").hexdigest()[:8], 16) % (2**31)
 
-            self.config.llm.random_seed = llm_seed
             for model_cfg in self.config.llm.models:
                 if not hasattr(model_cfg, "random_seed") or model_cfg.random_seed is None:
                     model_cfg.random_seed = llm_seed
@@ -128,22 +128,19 @@ class OpenEvolve:
         """Validate that the repository and root commit exist, and evaluation file is present."""
         if not os.path.isdir(self.git_repo_path):
             raise FileNotFoundError(f"Repository path not found: {self.git_repo_path}")
-        if not os.path.isdir(os.path.join(self.git_repo_path, ".git")):
+        # Validate repository via util
+        try:
+            ensure_repo(self.git_repo_path)
+        except Exception:
             raise RuntimeError(f"Path is not a git repository: {self.git_repo_path}")
         if not os.path.exists(self.evaluation_file):
             raise FileNotFoundError(f"Evaluation file not found: {self.evaluation_file}")
         # Validate root commit exists
         root_commit = self.config.database.root_commit or "HEAD"
-        import subprocess
-        proc = subprocess.run(
-            ["git", "-C", self.git_repo_path, "cat-file", "-e", f"{root_commit}^{{commit}}"],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
+        if not ref_exists(self.git_repo_path, root_commit):
             raise RuntimeError(
                 f"Root commit '{root_commit}' is not valid in repository {self.git_repo_path}: "
-                f"{proc.stderr or proc.stdout}"
+                f"ref not found"
             )
 
     async def run(

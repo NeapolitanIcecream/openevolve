@@ -11,7 +11,6 @@ class FileFilteringOptions:
     """Options for file filtering."""
 
     respect_git_ignore: bool = True
-    respect_gemini_ignore: bool = True
 
 
 @dataclass

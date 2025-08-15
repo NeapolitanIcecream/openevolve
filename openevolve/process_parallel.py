@@ -41,17 +41,26 @@ class SerializableResult:
 class WorktreePool:
     """Pre-create and manage a fixed number of git worktrees for parallel workers."""
 
-    def __init__(self, repo_path: str, base_commit: str, pool_size: int) -> None:
+    def __init__(
+        self,
+        repo_path: str,
+        base_commit: str,
+        pool_size: int,
+        *,
+        base_dir: Optional[str] = None,
+        git_user_name: str = "OpenEvolve",
+        git_user_email: str = "openevolve@example.com",
+    ) -> None:
         self.repo_path = os.path.abspath(repo_path)
         self.base_commit = base_commit
         self.pool_size = max(1, pool_size)
-        self.base_dir = os.path.join(self.repo_path, ".openevolve", "worktrees")
+        self.base_dir = base_dir or os.path.join(self.repo_path, ".openevolve", "worktrees")
         os.makedirs(self.base_dir, exist_ok=True)
 
         # Reduce lock contention and ensure commits work without relying on global config
         self._git_repo(["config", "gc.auto", "0"], check=False)
-        self._git_repo(["config", "user.name", "OpenEvolve"], check=False)
-        self._git_repo(["config", "user.email", "openevolve@example.com"], check=False)
+        self._git_repo(["config", "user.name", git_user_name], check=False)
+        self._git_repo(["config", "user.email", git_user_email], check=False)
 
         self.slots: List[str] = []
         self._in_use: Dict[str, bool] = {}
@@ -68,7 +77,8 @@ class WorktreePool:
         )
 
     def _git_repo(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-        proc = subprocess.run(["git", "-C", self.repo_path, *args], capture_output=True, text=True)
+        from openevolve.utils.git_utils import _run_git  # type: ignore
+        proc = _run_git(self.repo_path, args)
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr or proc.stdout}")
         return proc
@@ -108,17 +118,23 @@ def _worker_init(config_dict: Dict[str, Any], evaluation_file: str) -> None:
     # Reconstruct Config object from nested dictionaries
     from openevolve.config import Config, DatabaseConfig, EvaluatorConfig, LLMConfig, PromptConfig, LLMModelConfig
     
-    # Reconstruct model objects
-    models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], config_dict['llm']['models'])
-    evaluator_models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], config_dict['llm']['evaluator_models'])
+    # Reconstruct model objects and defaults
+    llm_block: Dict[str, Any] = cast(Dict[str, Any], config_dict['llm'])
+    models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], llm_block.get('models', []))
+    evaluator_models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], llm_block.get('evaluator_models', []))
     models = [LLMModelConfig(**m) for m in models_data]
     evaluator_models = [LLMModelConfig(**m) for m in evaluator_models_data]
-    
-    # Create LLM config with models
-    llm_dict: Dict[str, Any] = dict(cast(Dict[str, Any], config_dict['llm']))
-    llm_dict['models'] = models
-    llm_dict['evaluator_models'] = evaluator_models
-    llm_config = LLMConfig(**llm_dict)
+
+    defaults_dict: Dict[str, Any] = cast(Dict[str, Any], llm_block.get('defaults', {}))
+    defaults_cfg = LLMModelConfig(**defaults_dict) if isinstance(defaults_dict, dict) else LLMModelConfig()
+
+    llm_config = LLMConfig(
+        defaults=defaults_cfg,
+        models=models,
+        evaluator_models=evaluator_models,
+        write_tool_model_name=llm_block.get('write_tool_model_name'),
+        tool_loop_max_steps=llm_block.get('tool_loop_max_steps', 30),
+    )
     
     # Create other configs
     prompt_config = PromptConfig(**cast(Dict[str, Any], config_dict['prompt']))
@@ -228,7 +244,8 @@ def _run_iteration_worker(
 
         # Git helpers scoped to worktree
         def git(*args: str) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(["git", "-C", worktree_dir, *args], capture_output=True, text=True)
+            from openevolve.utils.git_utils import _run_git  # type: ignore
+            return _run_git(worktree_dir, list(args))
 
         # Ensure clean working tree
         git("reset", "--hard")
@@ -255,30 +272,27 @@ def _run_iteration_worker(
                 parent_commit=parent_commit,
                 iteration_context=iteration_context,
                 prompt_cfg=_worker_config.prompt,
-                max_steps=30,
+                max_steps=getattr(_worker_config.llm, 'tool_loop_max_steps', 30),
             )
         )
         metrics: Dict[str, Any] = run_out.get("metrics") or {}
         did_evaluate: bool = bool(run_out.get("did_evaluate"))
 
-        # 仅当 evaluate 被触发后才提交
-        if not did_evaluate:
+        # 仅当配置要求时强制 evaluate 之后再提交
+        require_eval = getattr(_worker_config.evaluator, 'require_evaluate_before_commit', True)
+        if require_eval and not did_evaluate:
             return SerializableResult(error="Iteration ended without calling evaluate tool", iteration=iteration)
 
-        commit_suffix = " ".join(
-            [f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}" for k, v in (metrics or {}).items()][:6]
-        )
-        commit_msg = f"OpenEvolve iteration {iteration} {commit_suffix}".strip()
-        git("add", "-A")
-        proc = git("commit", "--allow-empty", "-m", commit_msg)
-        if proc.returncode != 0:
-            return SerializableResult(error=f"git commit failed: {proc.stderr}", iteration=iteration)
-
-        # Get commit hash
-        proc = git("rev-parse", "HEAD")
-        if proc.returncode != 0:
-            return SerializableResult(error=f"git rev-parse failed: {proc.stderr}", iteration=iteration)
-        child_hash = proc.stdout.strip()
+        max_metrics = getattr(_worker_config.database, 'commit_message_max_metrics', 6)
+        metrics_list = [
+            f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
+            for k, v in (metrics or {}).items()
+        ][: max(0, max_metrics)]
+        commit_metrics = " ".join(metrics_list)
+        template = getattr(_worker_config.database, 'commit_message_template', 'OpenEvolve iteration {iteration} {metrics}')
+        commit_msg = template.format(iteration=iteration, metrics=commit_metrics).strip()
+        from openevolve.utils.git_utils import create_commit_from_worktree
+        child_hash = create_commit_from_worktree(worktree_dir, commit_msg)
 
         # Create child program (DB will compute diffs/signatures)
         child_program = Program(
@@ -338,17 +352,11 @@ class ProcessParallelController:
         # Manual serialization to handle nested objects properly
         return {
             'llm': {
+                'defaults': asdict(config.llm.defaults),
                 'models': [asdict(m) for m in config.llm.models],
                 'evaluator_models': [asdict(m) for m in config.llm.evaluator_models],
-                'api_base': config.llm.api_base,
-                'api_key': config.llm.api_key,
-                'temperature': config.llm.temperature,
-                'top_p': config.llm.top_p,
-                'max_tokens': config.llm.max_tokens,
-                'timeout': config.llm.timeout,
-                'retries': config.llm.retries,
-                'retry_delay': config.llm.retry_delay,
                 'write_tool_model_name': getattr(config.llm, 'write_tool_model_name', None),
+                'tool_loop_max_steps': getattr(config.llm, 'tool_loop_max_steps', 30),
             },
             'prompt': asdict(config.prompt),
             'database': asdict(config.database),
@@ -358,8 +366,6 @@ class ProcessParallelController:
             'log_level': config.log_level,
             'log_dir': config.log_dir,
             'random_seed': config.random_seed,
-            'diff_based_evolution': config.diff_based_evolution,
-            'max_code_length': config.max_code_length,
             'language': config.language,
         }
     
@@ -374,6 +380,9 @@ class ProcessParallelController:
             repo_path=self.config.database.git_repo_path,
             base_commit=self.config.database.root_commit,
             pool_size=max(1, self.num_workers),
+            base_dir=self.config.database.worktree_base_dir,
+            git_user_name=self.config.database.git_user_name,
+            git_user_email=self.config.database.git_user_email,
         )
         
         # Create process pool with initializer
@@ -416,14 +425,13 @@ class ProcessParallelController:
         }
         
         # Include artifacts for programs that might be selected
-        # IMPORTANT: This limits artifacts (execution outputs/errors) to first 100 programs only.
+        # IMPORTANT: This limits artifacts (execution outputs/errors) to a subset of programs only.
         # This does NOT affect program code - all programs are fully serialized above.
-        # With max_artifact_bytes=20KB and population_size=1000, artifacts could be 20MB total,
-        # which would significantly slow worker process initialization. The limit of 100 keeps
-        # artifact data under 2MB while still providing execution context for recent programs.
+        # Use configuration to limit snapshot size and avoid slow worker initialization.
         # Workers can still evolve properly as they have access to ALL program code.
         artifacts_map: Dict[str, Any] = cast(Dict[str, Any], snapshot["artifacts"])  # type: ignore[index]
-        for pid in list(self.database.programs.keys())[:100]:
+        limit = max(0, getattr(self.config.database, 'artifact_snapshot_programs_limit', 100))
+        for pid in list(self.database.programs.keys())[:limit]:
             artifacts = self.database.get_artifacts(pid)
             if artifacts:
                 artifacts_map[pid] = artifacts
@@ -470,7 +478,7 @@ class ProcessParallelController:
         stop_requested = False
         
         # Island management
-        programs_per_island = max(1, max_iterations // (self.config.database.num_islands * 10))
+        programs_per_island = max(1, getattr(self.config.database, 'island_programs_per_switch', 10))
         current_island_counter = 0
         
         # Process results as they complete
@@ -705,5 +713,5 @@ class ProcessParallelController:
             inspiration_diffs=inspiration_diffs,
             parent_metrics=parent.metrics or {},
             artifacts=None,
-            max_inspirations=2,
+            max_inspirations=getattr(self.config.prompt, 'max_inspirations', 2),
         )

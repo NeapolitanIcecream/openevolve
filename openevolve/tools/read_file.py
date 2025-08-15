@@ -63,8 +63,7 @@ class ReadFileTool(BaseTool):
         if params.get("limit") is not None and params["limit"] <= 0:
             return "Limit must be a positive number"
 
-        if self.file_service.should_gemini_ignore_file(file_path):
-            return f"File path '{file_path}' is ignored by .geminiignore pattern(s)."
+        # Gemini ignore is deprecated; no longer blocks access
 
         return None
 

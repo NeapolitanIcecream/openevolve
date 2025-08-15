@@ -21,9 +21,8 @@ class FileService:
         self.gitignore_spec = self._load_spec_from_file(
             os.path.join(self.config.root_dir, ".gitignore")
         )
-        self.geminiignore_spec = self._load_spec_from_file(
-            os.path.join(self.config.root_dir, ".geminiignore")
-        )
+        # Gemini ignore is deprecated in this project; keep an empty spec for compatibility
+        self.geminiignore_spec = pathspec.PathSpec.from_lines("gitwildmatch", [])
 
     def _load_spec_from_file(self, file_path: str) -> pathspec.PathSpec:
         """Loads a .gitignore-style file and returns a PathSpec object."""
@@ -34,8 +33,8 @@ class FileService:
         return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
     def get_gemini_ignore_patterns(self) -> List[str]:
-        """Returns the list of patterns from the .geminiignore file."""
-        return [str(p) for p in self.geminiignore_spec.patterns]
+        """Deprecated: returns an empty list (gemini ignore disabled)."""
+        return []
 
     def should_gemini_ignore_file(self, file_path: str) -> bool:
         """Checks if a file should be ignored based on .geminiignore rules."""
@@ -46,7 +45,8 @@ class FileService:
         self, files: List[str], respect_git_ignore: bool, respect_gemini_ignore: bool
     ) -> List[str]:
         """Filters a list of files based on the ignore rules."""
-        if not respect_git_ignore and not respect_gemini_ignore:
+        # respect_gemini_ignore is ignored (deprecated)
+        if not respect_git_ignore:
             return files
 
         filtered_files = []
@@ -54,11 +54,8 @@ class FileService:
             # The pathspec library works with relative paths
             relative_path = os.path.relpath(file_path, self.config.root_dir)
             is_git_ignored = respect_git_ignore and self.gitignore_spec.match_file(relative_path)
-            is_gemini_ignored = respect_gemini_ignore and self.geminiignore_spec.match_file(
-                relative_path
-            )
 
-            if not is_git_ignored and not is_gemini_ignored:
+            if not is_git_ignored:
                 filtered_files.append(file_path)
 
         return filtered_files

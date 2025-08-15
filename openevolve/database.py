@@ -17,6 +17,7 @@ import numpy as np
 from openevolve.config import DatabaseConfig
 from openevolve.utils.metrics_utils import safe_numeric_average
 from openevolve.utils.diff_utils import clean_diff, minhash_signature, minhash_similarity
+from openevolve.utils.git_utils import diff_between
 
 logger = logging.getLogger(__name__)
 
@@ -160,13 +161,13 @@ class ProgramDatabase:
         self.diversity_cache: Dict[int, Dict[str, Union[float, float]]] = (
             {}
         )  # hash -> {"value": float, "timestamp": float}
-        self.diversity_cache_size: int = 1000  # LRU cache size
+        self.diversity_cache_size: int = getattr(config, "diversity_cache_size", 1000)
         self.diversity_reference_set: List[List[int]] = []  # Reference signatures
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
         self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
-        self.feature_scaling_method: str = "minmax"  # Options: minmax, zscore, percentile
+        self.feature_scaling_method: str = getattr(config, "feature_scaling_method", "minmax")
 
         # Per-dimension bins support
         if hasattr(config, "feature_bins") and isinstance(config.feature_bins, dict):
@@ -204,7 +205,11 @@ class ProgramDatabase:
 
         # Ensure MinHash signature exists when hash_diff is available
         if program.hash_diff and not program.minhash_signature:
-            program.minhash_signature = minhash_signature(program.hash_diff)
+            program.minhash_signature = minhash_signature(
+                program.hash_diff,
+                num_perm=getattr(self.config, "minhash_num_perm", 64),
+                shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+            )
 
         # If no hash_diff yet but we do have a commit_hash, automatically compute diff
         if not program.hash_diff and program.commit_hash:
@@ -214,7 +219,11 @@ class ProgramDatabase:
                 if not program.prompt_diff:
                     program.prompt_diff = prompt_diff
                 program.hash_diff = hash_diff
-                program.minhash_signature = minhash_signature(hash_diff)
+                program.minhash_signature = minhash_signature(
+                    hash_diff,
+                    num_perm=getattr(self.config, "minhash_num_perm", 64),
+                    shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+                )
             except Exception as e:
                 logger.warning(
                     f"Failed to generate diff for commit {program.commit_hash}: {e}"
@@ -333,7 +342,9 @@ class ProgramDatabase:
         parent = self._sample_parent()
 
         # Select inspirations
-        inspirations = self._sample_inspirations(parent, n=5)
+        inspirations = self._sample_inspirations(
+            parent, n=getattr(self.config, "num_inspirations", 5)
+        )
 
         logger.debug(f"Sampled parent {parent.id} and {len(inspirations)} inspirations")
         return parent, inspirations
@@ -1547,7 +1558,7 @@ class ProgramDatabase:
         comparisons = 0
 
         # Use deterministic sampling instead of random.sample() to ensure consistent results
-        sample_size = min(5, len(programs))  # Reduced from 10 to 5
+        sample_size = min(getattr(self.config, "island_diversity_sample_size", 5), len(programs))
 
         # Sort programs by ID for deterministic ordering
         sorted_programs = sorted(programs, key=lambda p: p.id)
@@ -1556,7 +1567,7 @@ class ProgramDatabase:
         sample_programs = sorted_programs[:sample_size]
 
         # Limit total comparisons for performance
-        max_comparisons = 6  # Maximum comparisons to prevent long delays
+        max_comparisons = getattr(self.config, "island_diversity_max_comparisons", 6)
 
         for i, prog1 in enumerate(sample_programs):
             for prog2 in sample_programs[i + 1 :]:
@@ -1601,7 +1612,11 @@ class ProgramDatabase:
         # Ensure program has MinHash signature
         if not program.minhash_signature and (program.hash_diff or program.prompt_diff):
             text_for_sig = program.hash_diff or program.prompt_diff
-            program.minhash_signature = minhash_signature(text_for_sig or "")
+            program.minhash_signature = minhash_signature(
+                text_for_sig or "",
+                num_perm=getattr(self.config, "minhash_num_perm", 64),
+                shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+            )
 
         # Update reference set if needed
         if (
@@ -1636,7 +1651,11 @@ class ProgramDatabase:
             sigs = []
             for p in all_programs:
                 if not p.minhash_signature:
-                    p.minhash_signature = minhash_signature(p.hash_diff or p.prompt_diff or "")
+                    p.minhash_signature = minhash_signature(
+                        p.hash_diff or p.prompt_diff or "",
+                        num_perm=getattr(self.config, "minhash_num_perm", 64),
+                        shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+                    )
                 sigs.append(p.minhash_signature)
             self.diversity_reference_set = sigs
         else:
@@ -1655,11 +1674,19 @@ class ProgramDatabase:
 
                 for i, candidate in enumerate(remaining):
                     if not candidate.minhash_signature:
-                        candidate.minhash_signature = minhash_signature(candidate.hash_diff or candidate.prompt_diff or "")
+                        candidate.minhash_signature = minhash_signature(
+                            candidate.hash_diff or candidate.prompt_diff or "",
+                            num_perm=getattr(self.config, "minhash_num_perm", 64),
+                            shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+                        )
                     min_div = float("inf")
                     for selected_prog in selected:
                         if not selected_prog.minhash_signature:
-                            selected_prog.minhash_signature = minhash_signature(selected_prog.hash_diff or selected_prog.prompt_diff or "")
+                            selected_prog.minhash_signature = minhash_signature(
+                                selected_prog.hash_diff or selected_prog.prompt_diff or "",
+                                num_perm=getattr(self.config, "minhash_num_perm", 64),
+                                shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+                            )
                         div = 1.0 - minhash_similarity(candidate.minhash_signature, selected_prog.minhash_signature)
                         min_div = min(min_div, div)
 
@@ -2002,29 +2029,9 @@ class ProgramDatabase:
         repo_path = getattr(self.config, "git_repo_path", ".")
 
         try:
-            result = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    repo_path,
-                    "diff",
-                    "--binary",
-                    "--no-color",
-                    root,
-                    commit_hash,
-                    "--",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            raw_diff = result.stdout or ""
-        except FileNotFoundError:
-            logger.error("git executable not found – cannot compute commit diff")
-            return "", ""
+            raw_diff = diff_between(repo_path, root, commit_hash)
         except Exception as exc:
-            logger.warning(f"git diff invocation failed: {exc}")
+            logger.warning(f"git diff failed: {exc}")
             return "", ""
 
         return clean_diff(raw_diff)

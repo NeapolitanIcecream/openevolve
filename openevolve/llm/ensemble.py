@@ -60,7 +60,10 @@ class LLMEnsemble(LLMInterface):
     def _sample_model(self) -> LLMInterface:
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
         sampled_model = self.models[index]
-        logger.info(f"Sampled model: {vars(sampled_model)['model']}")
+        try:
+            logger.info(f"Sampled model: {vars(sampled_model)['model']}")
+        except Exception:
+            logger.info("Sampled a model from ensemble")
         return sampled_model
 
     async def invoke(

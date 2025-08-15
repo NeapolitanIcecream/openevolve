@@ -38,85 +38,84 @@ class LLMModelConfig:
 
 
 @dataclass
-class LLMConfig(LLMModelConfig):
-    """Configuration for LLM models"""
+class LLMConfig:
+    """Configuration for LLM ensemble (composition-based)."""
 
-    # API configuration
-    api_base: str = "https://api.openai.com/v1"
+    # Shared defaults applied to each model (unless model overrides)
+    defaults: LLMModelConfig = field(
+        default_factory=lambda: LLMModelConfig(
+            api_base="https://api.openai.com/v1",
+            system_message="system_message",
+            temperature=0.7,
+            top_p=0.95,
+            max_tokens=4096,
+            timeout=60,
+            retries=3,
+            retry_delay=5,
+        )
+    )
 
-    # Generation parameters
-    system_message: Optional[str] = "system_message"
-    temperature: float = 0.7
-    top_p: float = 0.95
-    max_tokens: int = 4096
-
-    # Request parameters
-    timeout: int = 60
-    retries: int = 3
-    retry_delay: int = 5
-
-    # n-model configuration for evolution LLM ensemble
+    # Ensemble configurations
     models: List[LLMModelConfig] = field(
         default_factory=lambda: [
             LLMModelConfig(name="gpt-4o-mini", weight=0.8),
             LLMModelConfig(name="gpt-4o", weight=0.2),
         ]
     )
-
-    # n-model configuration for evaluator LLM ensemble
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
+
     # Model used when the agent needs to perform write operations
     write_tool_model_name: Optional[str] = None
 
-    # Backwardes compatibility with primary_model(_weight) options
-    primary_model: Optional[str] = None
-    primary_model_weight: Optional[float] = None
-    secondary_model: Optional[str] = None
-    secondary_model_weight: Optional[float] = None
+    # Tool loop control
+    tool_loop_max_steps: int = 30
 
     def __post_init__(self):
-        """Post-initialization to set up model configurations"""
-        # Handle backward compatibility for primary_model(_weight) and secondary_model(_weight).
-        if (self.primary_model or self.primary_model_weight) and len(self.models) < 1:
-            # Ensure we have a primary model
-            self.models.append(LLMModelConfig())
-        if self.primary_model:
-            self.models[0].name = self.primary_model
-        if self.primary_model_weight:
-            self.models[0].weight = self.primary_model_weight
-
-        if (self.secondary_model or self.secondary_model_weight) and len(self.models) < 2:
-            # Ensure we have a second model
-            self.models.append(LLMModelConfig())
-        if self.secondary_model:
-            self.models[1].name = self.secondary_model
-        if self.secondary_model_weight:
-            self.models[1].weight = self.secondary_model_weight
-
         # If no evaluator models are defined, use the same models as for evolution
         if not self.evaluator_models or len(self.evaluator_models) < 1:
             self.evaluator_models = self.models.copy()
 
-        # Update models with shared configuration values
-        shared_config = {
-            "api_base": self.api_base,
-            "api_key": self.api_key,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens,
-            "timeout": self.timeout,
-            "retries": self.retries,
-            "retry_delay": self.retry_delay,
-            "random_seed": self.random_seed,
+        # Propagate defaults to models when fields are None
+        self._propagate_defaults()
+
+    def _propagate_defaults(self) -> None:
+        shared = {
+            "api_base": self.defaults.api_base,
+            "api_key": self.defaults.api_key,
+            "system_message": self.defaults.system_message,
+            "temperature": self.defaults.temperature,
+            "top_p": self.defaults.top_p,
+            "max_tokens": self.defaults.max_tokens,
+            "timeout": self.defaults.timeout,
+            "retries": self.defaults.retries,
+            "retry_delay": self.defaults.retry_delay,
+            "random_seed": self.defaults.random_seed,
         }
-        self.update_model_params(shared_config)
+        self.update_model_params(shared, overwrite=False)
 
     def update_model_params(self, args: Dict[str, Any], overwrite: bool = False) -> None:
-        """Update model parameters for all models"""
+        """Update parameters for defaults and all models.
+
+        - Defaults always updated (overwrite True assumed for defaults)
+        - Individual models updated only when attribute is None unless overwrite=True
+        """
+        # Update defaults
+        for key, value in args.items():
+            if value is not None:
+                setattr(self.defaults, key, value)
+        # Update models
         for model in self.models + self.evaluator_models:
             for key, value in args.items():
+                if value is None:
+                    continue
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)
+
+    def apply_env_defaults(self) -> None:
+        """Apply environment variables (api_base, api_key) into defaults and models."""
+        api_key = os.environ.get("OPENAI_API_KEY")
+        api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+        self.update_model_params({"api_key": api_key, "api_base": api_base})
 
 
 @dataclass
@@ -143,6 +142,9 @@ class PromptConfig:
     include_artifacts: bool = True
     max_artifact_bytes: int = 20 * 1024  # 20KB in prompt
     artifact_security_filter: bool = True
+
+    # Inspirations in prompt context
+    max_inspirations: int = 2
 
     # --- Long-session management (KV-cache friendly) ---
     session_max_tokens: int = 120000
@@ -181,6 +183,10 @@ class DatabaseConfig:
     root_commit: str = "HEAD"
     # Path to the git repository (defaults to current working directory)
     git_repo_path: str = "."
+    # Worktree pool settings
+    worktree_base_dir: Optional[str] = None  # Defaults to <repo>/.openevolve/worktrees
+    git_user_name: str = "OpenEvolve"
+    git_user_email: str = "openevolve@example.com"
 
     # Feature map dimensions for MAP-Elites
     # Default to complexity and diversity for better exploration
@@ -191,6 +197,27 @@ class DatabaseConfig:
     # Migration parameters for island-based evolution
     migration_interval: int = 50  # Migrate every N generations
     migration_rate: float = 0.1  # Fraction of population to migrate
+
+    # Sampling/inspiration
+    num_inspirations: int = 5
+
+    # Island switching cadence
+    island_programs_per_switch: int = 10
+
+    # Diversity estimation
+    island_diversity_sample_size: int = 5
+    island_diversity_max_comparisons: int = 6
+    diversity_cache_size: int = 1000
+    feature_scaling_method: str = "minmax"
+
+    # MinHash signature settings
+    minhash_num_perm: int = 64
+    minhash_shingle_len: int = 5
+
+    # Commit message and artifact snapshot
+    commit_message_template: str = "OpenEvolve iteration {iteration} {metrics}"
+    commit_message_max_metrics: int = 6
+    artifact_snapshot_programs_limit: int = 100
 
     # Random seed for reproducible sampling
     random_seed: Optional[int] = 42
@@ -230,6 +257,9 @@ class EvaluatorConfig:
     enable_artifacts: bool = True
     max_artifact_storage: int = 100 * 1024 * 1024  # 100MB per program
 
+    # Commit gating
+    require_evaluate_before_commit: bool = True
+
 
 @dataclass
 class Config:
@@ -249,9 +279,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
 
-    # Evolution settings
-    diff_based_evolution: bool = True
-    max_code_length: int = 10000
+    # Evolution settings (legacy removed in commit-based mode)
 
     @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "Config":
@@ -274,13 +302,19 @@ class Config:
         # Update nested configs
         if "llm" in config_dict:
             llm_dict = config_dict["llm"]
-            if "models" in llm_dict:
-                llm_dict["models"] = [LLMModelConfig(**m) for m in llm_dict["models"]]
-            if "evaluator_models" in llm_dict:
-                llm_dict["evaluator_models"] = [
-                    LLMModelConfig(**m) for m in llm_dict["evaluator_models"]
-                ]
-            config.llm = LLMConfig(**llm_dict)
+            # Build defaults
+            defaults_cfg = llm_dict.get("defaults", {})
+            defaults = LLMModelConfig(**defaults_cfg) if isinstance(defaults_cfg, dict) else LLMModelConfig()
+            # Build model lists
+            models = [LLMModelConfig(**m) for m in llm_dict.get("models", [])]
+            evaluator_models = [LLMModelConfig(**m) for m in llm_dict.get("evaluator_models", [])]
+            config.llm = LLMConfig(
+                defaults=defaults,
+                models=models or Config().llm.models,
+                evaluator_models=evaluator_models,
+                write_tool_model_name=llm_dict.get("write_tool_model_name"),
+                tool_loop_max_steps=llm_dict.get("tool_loop_max_steps", 30),
+            )
         if "prompt" in config_dict:
             config.prompt = PromptConfig(**config_dict["prompt"])
         if "database" in config_dict:
@@ -305,16 +339,22 @@ class Config:
             "random_seed": self.random_seed,
             # Component configurations
             "llm": {
+                "defaults": {
+                    "api_base": self.llm.defaults.api_base,
+                    "api_key": self.llm.defaults.api_key,
+                    "system_message": self.llm.defaults.system_message,
+                    "temperature": self.llm.defaults.temperature,
+                    "top_p": self.llm.defaults.top_p,
+                    "max_tokens": self.llm.defaults.max_tokens,
+                    "timeout": self.llm.defaults.timeout,
+                    "retries": self.llm.defaults.retries,
+                    "retry_delay": self.llm.defaults.retry_delay,
+                    "random_seed": self.llm.defaults.random_seed,
+                },
                 "models": self.llm.models,
                 "evaluator_models": self.llm.evaluator_models,
-                "api_base": self.llm.api_base,
-                "temperature": self.llm.temperature,
-                "top_p": self.llm.top_p,
-                "max_tokens": self.llm.max_tokens,
-                "timeout": self.llm.timeout,
-                "retries": self.llm.retries,
-                "retry_delay": self.llm.retry_delay,
                 "write_tool_model_name": self.llm.write_tool_model_name,
+                "tool_loop_max_steps": self.llm.tool_loop_max_steps,
             },
             "prompt": {
                 "template_dir": self.prompt.template_dir,
@@ -328,6 +368,10 @@ class Config:
                 "session_compress_threshold": self.prompt.session_compress_threshold,
                 "recent_history_tokens": self.prompt.recent_history_tokens,
                 "compression_model_name": self.prompt.compression_model_name,
+                "include_artifacts": self.prompt.include_artifacts,
+                "max_artifact_bytes": self.prompt.max_artifact_bytes,
+                "artifact_security_filter": self.prompt.artifact_security_filter,
+                "max_inspirations": self.prompt.max_inspirations,
                 # Note: meta-prompting features not implemented
                 # "use_meta_prompting": self.prompt.use_meta_prompting,
                 # "meta_prompt_weight": self.prompt.meta_prompt_weight,
@@ -343,6 +387,9 @@ class Config:
                 "exploitation_ratio": self.database.exploitation_ratio,
                 "root_commit": self.database.root_commit,
                 "git_repo_path": self.database.git_repo_path,
+                "worktree_base_dir": self.database.worktree_base_dir,
+                "git_user_name": self.database.git_user_name,
+                "git_user_email": self.database.git_user_email,
                 "feature_dimensions": self.database.feature_dimensions,
                 "feature_bins": self.database.feature_bins,
                 "migration_interval": self.database.migration_interval,
@@ -351,6 +398,21 @@ class Config:
                 "log_prompts": self.database.log_prompts,
                 "evolution_target": self.database.evolution_target,
                 "signature_similarity_threshold": self.database.signature_similarity_threshold,
+                "num_inspirations": self.database.num_inspirations,
+                "island_programs_per_switch": self.database.island_programs_per_switch,
+                "island_diversity_sample_size": self.database.island_diversity_sample_size,
+                "island_diversity_max_comparisons": self.database.island_diversity_max_comparisons,
+                "diversity_cache_size": self.database.diversity_cache_size,
+                "feature_scaling_method": self.database.feature_scaling_method,
+                "minhash_num_perm": self.database.minhash_num_perm,
+                "minhash_shingle_len": self.database.minhash_shingle_len,
+                "commit_message_template": self.database.commit_message_template,
+                "commit_message_max_metrics": self.database.commit_message_max_metrics,
+                "artifact_snapshot_programs_limit": self.database.artifact_snapshot_programs_limit,
+                "artifacts_base_path": self.database.artifacts_base_path,
+                "artifact_size_threshold": self.database.artifact_size_threshold,
+                "cleanup_old_artifacts": self.database.cleanup_old_artifacts,
+                "artifact_retention_days": self.database.artifact_retention_days,
             },
             "evaluator": {
                 "timeout": self.evaluator.timeout,
@@ -365,10 +427,10 @@ class Config:
                 # "distributed": self.evaluator.distributed,
                 "use_llm_feedback": self.evaluator.use_llm_feedback,
                 "llm_feedback_weight": self.evaluator.llm_feedback_weight,
+                "enable_artifacts": self.evaluator.enable_artifacts,
+                "max_artifact_storage": self.evaluator.max_artifact_storage,
+                "require_evaluate_before_commit": self.evaluator.require_evaluate_before_commit,
             },
-            # Evolution settings
-            "diff_based_evolution": self.diff_based_evolution,
-            "max_code_length": self.max_code_length,
         }
 
     def to_yaml(self, path: Union[str, Path]) -> None:
@@ -385,10 +447,7 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
         config = Config()
 
         # Use environment variables if available
-        api_key = os.environ.get("OPENAI_API_KEY")
-        api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
-
-        config.llm.update_model_params({"api_key": api_key, "api_base": api_base})
+        config.llm.apply_env_defaults()
 
     # Make the system message available to the individual models, in case it is not provided from the prompt sampler
     config.llm.update_model_params({"system_message": config.prompt.system_message})

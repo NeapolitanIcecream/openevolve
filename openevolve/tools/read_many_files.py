@@ -81,8 +81,7 @@ class ReadManyFilesTool(BaseTool):
                     "file_filtering_options": {
                         "type": "object",
                         "properties": {
-                            "respect_git_ignore": {"type": "boolean"},
-                            "respect_gemini_ignore": {"type": "boolean"},
+                            "respect_git_ignore": {"type": "boolean"}
                         },
                     },
                 },
@@ -122,9 +121,8 @@ class ReadManyFilesTool(BaseTool):
         respect_git_ignore = ff_opts.get(
             "respect_git_ignore", DEFAULT_FILE_FILTERING_OPTIONS.respect_git_ignore
         )
-        respect_gemini_ignore = ff_opts.get(
-            "respect_gemini_ignore", DEFAULT_FILE_FILTERING_OPTIONS.respect_gemini_ignore
-        )
+        # Deprecated option, ignored
+        respect_gemini_ignore = False
 
         effective_excludes = (DEFAULT_EXCLUDES + exclude) if use_default_excludes else exclude
         search_patterns = input_patterns + include
