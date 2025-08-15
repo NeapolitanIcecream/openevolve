@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(description="OpenEvolve - Evolutionary coding agent")
 
-    parser.add_argument("initial_program", help="Path to the initial program file")
+    parser.add_argument("git_repo", help="Path to the git repository for commit-based evolution")
 
     parser.add_argument(
         "evaluation_file", help="Path to the evaluation file containing an 'evaluate' function"
@@ -83,9 +83,12 @@ async def main_async() -> int:
     """
     args = parse_args()
 
-    # Check if files exist
-    if not os.path.exists(args.initial_program):
-        print(f"Error: Initial program file '{args.initial_program}' not found")
+    # Check repo and evaluation file exist
+    if not os.path.exists(args.git_repo) or not os.path.isdir(args.git_repo):
+        print(f"Error: Repository path '{args.git_repo}' not found or not a directory")
+        return 1
+    if not os.path.exists(os.path.join(args.git_repo, ".git")):
+        print(f"Error: Path '{args.git_repo}' is not a git repository (missing .git)")
         return 1
 
     if not os.path.exists(args.evaluation_file):
@@ -166,7 +169,7 @@ async def main_async() -> int:
     # Initialize OpenEvolve
     try:
         openevolve = OpenEvolve(
-            initial_program_path=args.initial_program,
+            git_repo_path=args.git_repo,
             evaluation_file=args.evaluation_file,
             config=config,
             config_path=args.config if config is None else None,

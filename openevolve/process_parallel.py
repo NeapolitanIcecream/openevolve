@@ -10,23 +10,19 @@ import asyncio
 import logging
 import multiprocessing as mp
 import os
-import pickle
-import signal
 import subprocess
 import time
-import json
 import uuid
 from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
 from openevolve.evaluator import Evaluator
-from openevolve.tools.registry import ToolRegistry
 from openevolve.llm.openai import OpenAILLM
 from openevolve.llm.session import ConversationSession
+from openevolve.prompt.sampler import PromptSampler
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +67,7 @@ class WorktreePool:
             f"WorktreePool initialized with {len(self.slots)} worktrees under {self.base_dir}"
         )
 
-    def _git_repo(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    def _git_repo(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         proc = subprocess.run(["git", "-C", self.repo_path, *args], capture_output=True, text=True)
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr or proc.stdout}")
@@ -97,7 +93,7 @@ class WorktreePool:
         else:
             logger.warning(f"Release called on unknown worktree {wt_dir}")
 
-def _worker_init(config_dict: dict, evaluation_file: str) -> None:
+def _worker_init(config_dict: Dict[str, Any], evaluation_file: str) -> None:
     """Initialize worker process with necessary components (commit-based)."""
     global _worker_config
     global _worker_evaluation_file
@@ -113,27 +109,28 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     from openevolve.config import Config, DatabaseConfig, EvaluatorConfig, LLMConfig, PromptConfig, LLMModelConfig
     
     # Reconstruct model objects
-    models = [LLMModelConfig(**m) for m in config_dict['llm']['models']]
-    evaluator_models = [LLMModelConfig(**m) for m in config_dict['llm']['evaluator_models']]
+    models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], config_dict['llm']['models'])
+    evaluator_models_data: List[Dict[str, Any]] = cast(List[Dict[str, Any]], config_dict['llm']['evaluator_models'])
+    models = [LLMModelConfig(**m) for m in models_data]
+    evaluator_models = [LLMModelConfig(**m) for m in evaluator_models_data]
     
     # Create LLM config with models
-    llm_dict = config_dict['llm'].copy()
+    llm_dict: Dict[str, Any] = dict(cast(Dict[str, Any], config_dict['llm']))
     llm_dict['models'] = models
     llm_dict['evaluator_models'] = evaluator_models
     llm_config = LLMConfig(**llm_dict)
     
     # Create other configs
-    prompt_config = PromptConfig(**config_dict['prompt'])
-    database_config = DatabaseConfig(**config_dict['database'])
-    evaluator_config = EvaluatorConfig(**config_dict['evaluator'])
+    prompt_config = PromptConfig(**cast(Dict[str, Any], config_dict['prompt']))
+    database_config = DatabaseConfig(**cast(Dict[str, Any], config_dict['database']))
+    evaluator_config = EvaluatorConfig(**cast(Dict[str, Any], config_dict['evaluator']))
     
     _worker_config = Config(
         llm=llm_config,
         prompt=prompt_config,
         database=database_config,
         evaluator=evaluator_config,
-        **{k: v for k, v in config_dict.items() 
-           if k not in ['llm', 'prompt', 'database', 'evaluator']}
+        **{k: v for k, v in config_dict.items() if k not in ['llm', 'prompt', 'database', 'evaluator']}
     )
     _worker_evaluation_file = evaluation_file
     
@@ -144,14 +141,9 @@ def _worker_init(config_dict: dict, evaluation_file: str) -> None:
     _worker_registry = None
     _worker_llm = None
 
-    # 统一的会话管理（OpenAI 兼容历史）
-    _worker_session = ConversationSession(
-        system_message=(
-            "You are an expert software agent operating inside a git worktree. "
-            "Use the tools to read files, make minimal safe edits, and finally call 'evaluate' once to finish an iteration. "
-            "Always use absolute paths under the provided root, avoid destructive changes, and keep edits consistent."
-        )
-    )
+    # 统一的会话管理（使用 PromptSampler 生成稳定系统提示）
+    _worker_prompt_sampler = PromptSampler(prompt_config)
+    _worker_session = ConversationSession(system_message=_worker_prompt_sampler.build_system_message())
 
     # Initialize repo-level evaluator for this worker
     try:
@@ -235,7 +227,7 @@ def _run_iteration_worker(
         iteration_start = time.time()
 
         # Git helpers scoped to worktree
-        def git(*args: str) -> subprocess.CompletedProcess:
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(["git", "-C", worktree_dir, *args], capture_output=True, text=True)
 
         # Ensure clean working tree
@@ -333,6 +325,7 @@ class ProcessParallelController:
         
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
+        self.worktree_pool: Optional[WorktreePool] = None
         
         # Number of worker processes
         self.num_workers = config.evaluator.parallel_evaluations
@@ -340,7 +333,7 @@ class ProcessParallelController:
         
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
     
-    def _serialize_config(self, config: Config) -> dict:
+    def _serialize_config(self, config: Config) -> Dict[str, Any]:
         """Serialize config object to a dictionary that can be pickled"""
         # Manual serialization to handle nested objects properly
         return {
@@ -410,7 +403,7 @@ class ProcessParallelController:
     def _create_database_snapshot(self) -> Dict[str, Any]:
         """Create a serializable snapshot of the database state"""
         # Only include necessary data for workers
-        snapshot = {
+        snapshot: Dict[str, Any] = {
             "programs": {
                 pid: prog.to_dict() 
                 for pid, prog in self.database.programs.items()
@@ -429,10 +422,11 @@ class ProcessParallelController:
         # which would significantly slow worker process initialization. The limit of 100 keeps
         # artifact data under 2MB while still providing execution context for recent programs.
         # Workers can still evolve properly as they have access to ALL program code.
+        artifacts_map: Dict[str, Any] = cast(Dict[str, Any], snapshot["artifacts"])  # type: ignore[index]
         for pid in list(self.database.programs.keys())[:100]:
             artifacts = self.database.get_artifacts(pid)
             if artifacts:
-                snapshot["artifacts"][pid] = artifacts
+                artifacts_map[pid] = artifacts
         
         return snapshot
     
@@ -441,13 +435,14 @@ class ProcessParallelController:
         start_iteration: int,
         max_iterations: int,
         target_score: Optional[float] = None,
-        checkpoint_callback=None,
+        checkpoint_callback: Optional[Callable[[int], None]] = None,
     ):
         """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
-        if not hasattr(self, 'worktree_pool') or self.worktree_pool is None:
+        if self.worktree_pool is None:
             raise RuntimeError("Worktree pool not initialized")
+        wt_pool = self.worktree_pool
         
         total_iterations = start_iteration + max_iterations
         
@@ -457,7 +452,7 @@ class ProcessParallelController:
         )
         
         # Track pending futures
-        pending_futures: Dict[int, Future] = {}
+        pending_futures: Dict[int, Future[SerializableResult]] = {}
         deferred_iterations: List[int] = []  # iterations that failed to submit due to capacity and should be retried
         batch_size = min(self.num_workers * 2, max_iterations)
         
@@ -499,7 +494,7 @@ class ProcessParallelController:
             future = pending_futures.pop(completed_iteration)
             
             try:
-                result = future.result()
+                result: SerializableResult = future.result()
                 
                 if result.error:
                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
@@ -540,10 +535,7 @@ class ProcessParallelController:
                     )
                     
                     if child_program.metrics:
-                        metrics_str = ", ".join([
-                            f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
-                            for k, v in child_program.metrics.items()
-                        ])
+                        metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in child_program.metrics.items()])
                         logger.info(f"Metrics: {metrics_str}")
                         
                         # Check if this is the first program without combined_score
@@ -578,10 +570,7 @@ class ProcessParallelController:
                     
                     # Check target score
                     if target_score is not None and child_program.metrics:
-                        numeric_metrics = [
-                            v for v in child_program.metrics.values()
-                            if isinstance(v, (int, float))
-                        ]
+                        numeric_metrics = list(child_program.metrics.values())
                         if numeric_metrics:
                             avg_score = sum(numeric_metrics) / len(numeric_metrics)
                             if avg_score >= target_score:
@@ -597,8 +586,7 @@ class ProcessParallelController:
             # Release any worktree assigned to the completed iteration ASAP to improve throughput
             if completed_iteration in self._worktree_assignments:
                 wt_dir = self._worktree_assignments.pop(completed_iteration)
-                if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
-                    self.worktree_pool.release(wt_dir)
+                wt_pool.release(wt_dir)
 
             completed_iterations += 1
 
@@ -636,25 +624,29 @@ class ProcessParallelController:
                 future.cancel()
 
         # Release any worktrees still assigned to in-flight or canceled iterations
-        if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
-            for it, wt_dir in list(self._worktree_assignments.items()):
-                try:
-                    self.worktree_pool.release(wt_dir)
-                except Exception:
-                    pass
-                finally:
-                    self._worktree_assignments.pop(it, None)
+        for it, wt_dir in list(self._worktree_assignments.items()):
+            try:
+                wt_pool.release(wt_dir)
+            except Exception:
+                pass
+            finally:
+                self._worktree_assignments.pop(it, None)
 
         logger.info("Evolution completed")
         
         return self.database.get_best_program()
     
-    def _submit_iteration(self, iteration: int) -> Optional[Future]:
+    def _submit_iteration(self, iteration: int) -> Optional[Future[SerializableResult]]:
         """Submit an iteration to the process pool (commit-based)."""
         worktree_dir: Optional[str] = None
         try:
             # Avoid scheduling when executor not available or shutting down
             if self.executor is None or self.shutdown_event.is_set():
+                return None
+            # Ensure worktree pool is available
+            wt_pool = self.worktree_pool
+            if wt_pool is None:
+                logging.warning("Worktree pool not initialized; cannot submit iteration")
                 return None
 
             # Sample parent and inspirations
@@ -664,7 +656,7 @@ class ProcessParallelController:
             db_snapshot = self._create_database_snapshot()
             
             # Acquire a dedicated worktree for this iteration
-            worktree_dir = self.worktree_pool.acquire()
+            worktree_dir = wt_pool.acquire()
             if not worktree_dir:
                 logger.warning("No available worktree to schedule iteration; delaying submission")
                 return None
@@ -692,26 +684,26 @@ class ProcessParallelController:
             logger.error(f"Error submitting iteration {iteration}: {e}")
             # Ensure we release any acquired worktree on failure
             try:
-                if worktree_dir:
-                    if hasattr(self, 'worktree_pool') and self.worktree_pool is not None:
-                        self.worktree_pool.release(worktree_dir)
+                if worktree_dir and self.worktree_pool is not None:
+                    self.worktree_pool.release(worktree_dir)
             except Exception:
                 pass
             return None
 
     def _build_iteration_context(self, parent: Program, inspirations: List[Program]) -> str:
-        """Build a simple textual context for the worker's LLM session."""
-        parts: List[str] = []
+        """Build per-iteration context using PromptSampler."""
+        sampler = PromptSampler(self.config.prompt)
         target = getattr(self.config.database, "evolution_target", None)
-        if target:
-            parts.append(f"Goal: {target}")
-        if getattr(parent, "prompt_diff", None):
-            parts.append("Parent changes (root→parent):\n" + (parent.prompt_diff or ""))
-        count = 0
+        parent_diff = getattr(parent, "prompt_diff", None)
+        inspiration_diffs: List[str] = []
         for insp in inspirations:
             if getattr(insp, "prompt_diff", None):
-                parts.append("Inspiration (root→commit):\n" + (insp.prompt_diff or ""))
-                count += 1
-                if count >= 2:
-                    break
-        return "\n\n".join(parts)
+                inspiration_diffs.append(insp.prompt_diff or "")
+        return sampler.build_iteration_context(
+            evolution_target=target,
+            parent_prompt_diff=parent_diff,
+            inspiration_diffs=inspiration_diffs,
+            parent_metrics=parent.metrics or {},
+            artifacts=None,
+            max_inspirations=2,
+        )

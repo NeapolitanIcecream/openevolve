@@ -1,5 +1,5 @@
 """
-Main controller for OpenEvolve
+Main controller for OpenEvolve (commit-based evolution)
 """
 
 import asyncio
@@ -13,48 +13,12 @@ from typing import Any, Dict, List, Optional, Union
 
 from openevolve.config import Config, load_config
 from openevolve.database import Program, ProgramDatabase
-from openevolve.evaluator import Evaluator
-from openevolve.llm.ensemble import LLMEnsemble
-from openevolve.prompt.sampler import PromptSampler
 from openevolve.process_parallel import ProcessParallelController
-from openevolve.tools.registry import ToolRegistry
-from openevolve.utils.code_utils import (
-    extract_code_language,
-)
 from openevolve.utils.format_utils import (
     format_metrics_safe,
-    format_improvement_safe,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _format_metrics(metrics: Dict[str, Any]) -> str:
-    """Safely format metrics, handling both numeric and string values"""
-    formatted_parts = []
-    for name, value in metrics.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            try:
-                formatted_parts.append(f"{name}={value:.4f}")
-            except (ValueError, TypeError):
-                formatted_parts.append(f"{name}={value}")
-        else:
-            formatted_parts.append(f"{name}={value}")
-    return ", ".join(formatted_parts)
-
-
-def _format_improvement(improvement: Dict[str, Any]) -> str:
-    """Safely format improvement metrics"""
-    formatted_parts = []
-    for name, diff in improvement.items():
-        if isinstance(diff, (int, float)) and not isinstance(diff, bool):
-            try:
-                formatted_parts.append(f"{name}={diff:+.4f}")
-            except (ValueError, TypeError):
-                formatted_parts.append(f"{name}={diff}")
-        else:
-            formatted_parts.append(f"{name}={diff}")
-    return ", ".join(formatted_parts)
 
 
 class OpenEvolve:
@@ -73,7 +37,7 @@ class OpenEvolve:
 
     def __init__(
         self,
-        initial_program_path: str,
+        git_repo_path: str,
         evaluation_file: str,
         config_path: Optional[str] = None,
         config: Optional[Config] = None,
@@ -81,36 +45,34 @@ class OpenEvolve:
     ):
         # Load configuration
         if config is not None:
-            # Use provided Config object directly
             self.config = config
         else:
-            # Load from file or use defaults
             self.config = load_config(config_path)
 
-        # Set up output directory
-        self.output_dir = output_dir or os.path.join(
-            os.path.dirname(initial_program_path), "openevolve_output"
-        )
+        # Normalize and store repo path in config
+        self.git_repo_path = os.path.abspath(git_repo_path)
+        if not self.config.database.git_repo_path or self.config.database.git_repo_path == ".":
+            self.config.database.git_repo_path = self.git_repo_path
+
+        # Set up output directory under repo
+        self.output_dir = output_dir or os.path.join(self.git_repo_path, "openevolve_output")
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Set up logging
         self._setup_logging()
 
-        # Set random seed for reproducibility if specified
+        # Set random seed for reproducibility if specified (propagate to models)
         if self.config.random_seed is not None:
             import random
             import numpy as np
             import hashlib
 
-            # Set global random seeds
             random.seed(self.config.random_seed)
             np.random.seed(self.config.random_seed)
 
-            # Create hash-based seeds for different components
             base_seed = str(self.config.random_seed).encode("utf-8")
             llm_seed = int(hashlib.md5(base_seed + b"llm").hexdigest()[:8], 16) % (2**31)
 
-            # Propagate seed to LLM configurations
             self.config.llm.random_seed = llm_seed
             for model_cfg in self.config.llm.models:
                 if not hasattr(model_cfg, "random_seed") or model_cfg.random_seed is None:
@@ -122,59 +84,20 @@ class OpenEvolve:
             logger.info(f"Set random seed to {self.config.random_seed} for reproducibility")
             logger.debug(f"Generated LLM seed: {llm_seed}")
 
-        # Load initial program
-        self.initial_program_path = initial_program_path
-        self.initial_program_code = self._load_initial_program()
-        if not self.config.language:
-            self.config.language = extract_code_language(self.initial_program_code)
+        # Validate repository and evaluation script
+        self.evaluation_file = evaluation_file
+        self._validate_repo()
 
-        # Extract file extension from initial program
-        self.file_extension = os.path.splitext(initial_program_path)[1]
-        if not self.file_extension:
-            # Default to .py if no extension found
-            self.file_extension = ".py"
-        else:
-            # Make sure it starts with a dot
-            if not self.file_extension.startswith("."):
-                self.file_extension = f".{self.file_extension}"
-
-        # Initialize components in the correct order to handle dependencies
-        # 1. ToolRegistry is created first（注册读/写与评估工具）。
-        self.tool_registry = ToolRegistry(
-            config={"root_dir": os.path.dirname(initial_program_path)},
-            evaluator=None,  # 评估工具在 Evaluator 初始化后注入
-        )
-
-        # 2. LLM ensemble（用于代码读写工具调用）。
-        self.llm_ensemble = LLMEnsemble(
-            self.config.llm.models, tool_registry=self.tool_registry
-        )
-
-        # 3. The LLM client is set back into the tool_registry to resolve circular dependency.
-        self.tool_registry.set_llm_client(self.llm_ensemble)
-        
-
-        self.prompt_sampler = PromptSampler(self.config.prompt)
-
-        # Pass random seed to database if specified
+        # Ensure database inherits random seed
         if self.config.random_seed is not None:
             self.config.database.random_seed = self.config.random_seed
 
+        # Initialize database (commit-based)
         self.database = ProgramDatabase(self.config.database)
 
-        self.evaluator = Evaluator(
-            self.config.evaluator,
-            evaluation_file,
-            database=self.database,
-        )
-        self.evaluation_file = evaluation_file
+        logger.info(f"Initialized OpenEvolve (commit-based) with repo: {self.git_repo_path}")
 
-        # 将 evaluator 注入工具注册表，提供 evaluate 工具
-        self.tool_registry.set_evaluator(self.evaluator)
-
-        logger.info(f"Initialized OpenEvolve with {initial_program_path}")
-
-        # Initialize improved parallel processing components
+        # Parallel controller holder
         self.parallel_controller = None
 
     def _setup_logging(self) -> None:
@@ -201,10 +124,27 @@ class OpenEvolve:
 
         logger.info(f"Logging to {log_file}")
 
-    def _load_initial_program(self) -> str:
-        """Load the initial program from file"""
-        with open(self.initial_program_path, "r") as f:
-            return f.read()
+    def _validate_repo(self) -> None:
+        """Validate that the repository and root commit exist, and evaluation file is present."""
+        if not os.path.isdir(self.git_repo_path):
+            raise FileNotFoundError(f"Repository path not found: {self.git_repo_path}")
+        if not os.path.isdir(os.path.join(self.git_repo_path, ".git")):
+            raise RuntimeError(f"Path is not a git repository: {self.git_repo_path}")
+        if not os.path.exists(self.evaluation_file):
+            raise FileNotFoundError(f"Evaluation file not found: {self.evaluation_file}")
+        # Validate root commit exists
+        root_commit = self.config.database.root_commit or "HEAD"
+        import subprocess
+        proc = subprocess.run(
+            ["git", "-C", self.git_repo_path, "cat-file", "-e", f"{root_commit}^{{commit}}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Root commit '{root_commit}' is not valid in repository {self.git_repo_path}: "
+                f"{proc.stderr or proc.stdout}"
+            )
 
     async def run(
         self,
@@ -281,8 +221,8 @@ class OpenEvolve:
 
             self.parallel_controller.start()
 
-            # When starting from iteration 0, we've already done the initial program evaluation
-            # So we need to adjust the start_iteration for the actual evolution
+            # When starting from iteration 0 and initial program was just added,
+            # start actual evolution from iteration 1
             evolution_start = start_iteration
             evolution_iterations = max_iterations
             
@@ -346,31 +286,7 @@ class OpenEvolve:
             logger.warning("No valid programs found during evolution")
             return None
 
-    def _log_iteration(
-        self,
-        iteration: int,
-        parent: Program,
-        child: Program,
-        elapsed_time: float,
-    ) -> None:
-        """
-        Log iteration progress
-
-        Args:
-            iteration: Iteration number
-            parent: Parent program
-            child: Child program
-            elapsed_time: Elapsed time in seconds
-        """
-        # Calculate improvement using safe formatting
-        improvement_str = format_improvement_safe(parent.metrics, child.metrics)
-
-        logger.info(
-            f"Iteration {iteration+1}: Child {child.id} from parent {parent.id} "
-            f"in {elapsed_time:.2f}s. Metrics: "
-            f"{format_metrics_safe(child.metrics)} "
-            f"(Δ: {improvement_str})"
-        )
+    # Note: Detailed per-iteration logging is handled by the parallel controller in commit-based mode
 
     def _save_checkpoint(self, iteration: int) -> None:
         """

@@ -12,7 +12,12 @@ _PROMPT_SAMPLER_LOGGED = False
 
 
 class PromptSampler:
-    """构造基于提交的提示词（不依赖代码片段）。"""
+    """构造基于提交的提示词（不依赖代码片段）。
+
+    职责：
+    - 会话级（稳定、KV-cache 友好）的 system message 构建
+    - 迭代级（小而精的增量）iteration context 构建
+    """
 
     def __init__(self, config: PromptConfig):
         self.config = config
@@ -24,6 +29,57 @@ class PromptSampler:
     def set_templates(self, system_template: Optional[str] = None, user_template: Optional[str] = None) -> None:
         # 保留接口以兼容外部调用，但 commit-based 版本不使用模板系统
         logger.info(f"(ignored) set_templates: system={system_template}, user={user_template}")
+
+    def build_system_message(self) -> str:
+        """返回本会话使用的系统提示（稳定、可缓存）。
+
+        优先使用 `PromptConfig.system_message`，若为空或为占位值则回退到安全且工具导向的默认指令。
+        """
+        configured = (self.config.system_message or "").strip()
+        if configured and configured != "system_message":
+            return configured
+        return (
+            "You are an expert software agent operating inside a git worktree. "
+            "Use the tools to read files, make minimal safe edits, and finally call 'evaluate' once to finish an iteration. "
+            "Always use absolute paths under the provided root, avoid destructive changes, and keep edits consistent."
+        )
+
+    def build_iteration_context(
+        self,
+        evolution_target: Optional[str],
+        parent_prompt_diff: Optional[str],
+        inspiration_diffs: List[str],
+        parent_metrics: Dict[str, Any],
+        artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
+        max_inspirations: int = 2,
+    ) -> str:
+        """构造单次迭代的上下文文本（追加到会话历史）。
+
+        仅包含必要增量：目标、父代与灵感的 diff 摘要、父代评估指标，以及可选的上次执行工件摘要。
+        """
+        parts: List[str] = []
+        if evolution_target:
+            parts.append(f"Goal: {evolution_target}")
+
+        if parent_prompt_diff:
+            parts.append("Parent changes (root→parent):\n" + parent_prompt_diff)
+
+        if inspiration_diffs:
+            use = inspiration_diffs[: max(0, max_inspirations)]
+            for diff in use:
+                if not diff:
+                    continue
+                parts.append("Inspiration (root→commit):\n" + diff)
+
+        if parent_metrics:
+            parts.append("Last evaluation (parent):\n" + self._format_metrics(parent_metrics))
+
+        if self.config.include_artifacts and artifacts:
+            rendered = self._render_artifacts(artifacts)
+            if rendered:
+                parts.append(rendered)
+
+        return "\n\n".join(parts).strip()
 
     def build_commit_prompt(
         self,
