@@ -40,8 +40,17 @@ class OpenAILLM(LLMInterface):
         self.api_key = model_cfg.api_key
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.tool_registry = tool_registry
-        # 外部会话（统一历史来源）
+        # External session (single source of conversation history)
         self._session: Optional[ConversationSession] = None
+
+        # Usage cumulative stats
+        self._usage_cumulative: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "calls": 0,
+        }
 
         # Set up API client
         self.client = openai.OpenAI(
@@ -139,6 +148,40 @@ class OpenAILLM(LLMInterface):
 
                 result = LLMResult(content=content_text, tool_calls=tool_calls_out, raw=response)
 
+                # Extract usage and log token stats and cache percentage
+                usage_info = self._extract_usage(response)
+                if usage_info:
+                    result.usage = usage_info
+                    self._accumulate_usage(usage_info)
+                    try:
+                        prompt_tokens = usage_info.get("prompt_tokens", 0)
+                        completion_tokens = usage_info.get("completion_tokens", 0)
+                        total_tokens = usage_info.get("total_tokens", 0)
+                        cached_tokens = usage_info.get("cached_tokens", 0)
+                        percent_cached = (cached_tokens / prompt_tokens * 100.0) if prompt_tokens else 0.0
+                        logger.info(
+                            "Tokens used: prompt=%d, completion=%d, total=%d | cached=%d (%.1f%%)",
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            cached_tokens,
+                            percent_cached,
+                        )
+                        # Also log cumulative usage briefly
+                        cum = self.get_usage_stats()
+                        logger.debug(
+                            "Cumulative tokens: prompt=%d, completion=%d, total=%d | cached=%d (%.1f%%) in %d calls",
+                            cum.get("prompt_tokens", 0),
+                            cum.get("completion_tokens", 0),
+                            cum.get("total_tokens", 0),
+                            cum.get("cached_tokens", 0),
+                            cum.get("percent_cached", 0.0),
+                            cum.get("calls", 0),
+                        )
+                    except Exception:
+                        # Avoid breaking flow on logging failure
+                        pass
+
                 # If JSON expected, parse strictly
                 if params.get("response_format") is not None and not tool_calls_out:
                     if not content_text:
@@ -193,6 +236,82 @@ class OpenAILLM(LLMInterface):
 
     def _fallback(self, v: Optional[Any], default: Optional[Any]) -> Optional[Any]:
         return v if v is not None else default
+
+    def _extract_usage(self, response: Any) -> Dict[str, Any]:
+        """Extract usage info from OpenAI response robustly.
+
+        Returns keys: prompt_tokens, completion_tokens, total_tokens, cached_tokens
+        """
+        usage: Dict[str, Any] = {}
+        try:
+            raw_usage = getattr(response, "usage", None)
+            if raw_usage is None and hasattr(response, "to_dict"):
+                # Fallback for some client variants
+                try:
+                    raw_dict = response.to_dict()
+                    raw_usage = raw_dict.get("usage") if isinstance(raw_dict, dict) else None
+                except Exception:
+                    raw_usage = None
+            if raw_usage is None and hasattr(response, "model_dump"):
+                try:
+                    raw_usage = response.model_dump().get("usage")
+                except Exception:
+                    raw_usage = None
+
+            # Normalize attribute/dict style access
+            def _get(obj: Any, key: str, default: Any = 0) -> Any:
+                if obj is None:
+                    return default
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            prompt_tokens = int(_get(raw_usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(_get(raw_usage, "completion_tokens", 0) or 0)
+            total_tokens = int(_get(raw_usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
+
+            # cached_tokens often lives in prompt_tokens_details.cached_tokens
+            prompt_tokens_details = _get(raw_usage, "prompt_tokens_details", None)
+            cached_tokens = int(_get(prompt_tokens_details, "cached_tokens", 0) or 0)
+
+            usage.update(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "cached_tokens": cached_tokens,
+                }
+            )
+        except Exception:
+            # Provide at least zeroed structure to avoid KeyErrors upstream
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
+        return usage
+
+    def _accumulate_usage(self, usage: Dict[str, Any]) -> None:
+        try:
+            self._usage_cumulative["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+            self._usage_cumulative["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+            self._usage_cumulative["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+            self._usage_cumulative["cached_tokens"] += int(usage.get("cached_tokens", 0) or 0)
+            self._usage_cumulative["calls"] += 1
+        except Exception:
+            pass
+
+    def get_usage_stats(self) -> Dict[str, Any]:
+        try:
+            prompt = self._usage_cumulative.get("prompt_tokens", 0) or 0
+            cached = self._usage_cumulative.get("cached_tokens", 0) or 0
+            percent_cached = (cached / prompt * 100.0) if prompt else 0.0
+        except Exception:
+            percent_cached = 0.0
+        return {
+            "prompt_tokens": int(self._usage_cumulative.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(self._usage_cumulative.get("completion_tokens", 0) or 0),
+            "total_tokens": int(self._usage_cumulative.get("total_tokens", 0) or 0),
+            "cached_tokens": int(self._usage_cumulative.get("cached_tokens", 0) or 0),
+            "calls": int(self._usage_cumulative.get("calls", 0) or 0),
+            "percent_cached": percent_cached,
+        }
 
     # --- Session attachment API ---
     def attach_session(self, session: ConversationSession) -> None:

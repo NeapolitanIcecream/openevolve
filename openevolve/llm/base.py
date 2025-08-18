@@ -20,6 +20,8 @@ class LLMResult:
     tool_calls: List[ToolCall] = field(default_factory=list)
     json: Optional[Any] = None
     raw: Optional[Any] = None
+    # Optional usage stats for token accounting
+    usage: Optional[Dict[str, Any]] = None
 
 
 class LLMInterface(ABC):

@@ -57,6 +57,15 @@ class LLMEnsemble(LLMInterface):
         # Shared session across ensemble members
         self._session: Optional[ConversationSession] = None
 
+        # Usage cumulative stats across ensemble
+        self._usage_cumulative: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+            "calls": 0,
+        }
+
     def _sample_model(self) -> LLMInterface:
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
         sampled_model = self.models[index]
@@ -83,7 +92,7 @@ class LLMEnsemble(LLMInterface):
         retry_delay: Optional[float] = None,
     ) -> LLMResult:
         model = self._sample_model()
-        return await model.invoke(
+        result = await model.invoke(
             messages=messages,
             system_message=system_message,
             response_format=response_format,
@@ -97,6 +106,28 @@ class LLMEnsemble(LLMInterface):
             retries=retries,
             retry_delay=retry_delay,
         )
+        try:
+            usage = getattr(result, "usage", None)
+            if isinstance(usage, dict):
+                self._usage_cumulative["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                self._usage_cumulative["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                self._usage_cumulative["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+                self._usage_cumulative["cached_tokens"] += int(usage.get("cached_tokens", 0) or 0)
+                self._usage_cumulative["calls"] += 1
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                cached_tokens = int(usage.get("cached_tokens", 0) or 0)
+                percent_cached = (cached_tokens / prompt_tokens * 100.0) if prompt_tokens else 0.0
+                logger.info(
+                    "[Ensemble] Tokens used: prompt=%d, completion=%d, total=%d | cached=%d (%.1f%%)",
+                    int(usage.get("prompt_tokens", 0) or 0),
+                    int(usage.get("completion_tokens", 0) or 0),
+                    int(usage.get("total_tokens", 0) or 0),
+                    cached_tokens,
+                    percent_cached,
+                )
+        except Exception:
+            pass
+        return result
 
     async def get_history(self) -> List[Dict[str, Any]]:
         return self._session.get_history() if self._session else []
@@ -116,3 +147,20 @@ class LLMEnsemble(LLMInterface):
             except Exception:
                 pass
         self._session = None
+
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """Return cumulative usage stats across the ensemble."""
+        try:
+            prompt = self._usage_cumulative.get("prompt_tokens", 0) or 0
+            cached = self._usage_cumulative.get("cached_tokens", 0) or 0
+            percent_cached = (cached / prompt * 100.0) if prompt else 0.0
+        except Exception:
+            percent_cached = 0.0
+        return {
+            "prompt_tokens": int(self._usage_cumulative.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(self._usage_cumulative.get("completion_tokens", 0) or 0),
+            "total_tokens": int(self._usage_cumulative.get("total_tokens", 0) or 0),
+            "cached_tokens": int(self._usage_cumulative.get("cached_tokens", 0) or 0),
+            "calls": int(self._usage_cumulative.get("calls", 0) or 0),
+            "percent_cached": percent_cached,
+        }

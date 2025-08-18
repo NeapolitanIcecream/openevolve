@@ -17,11 +17,11 @@ from .config import Config as ToolConfig
 
 
 class EvaluateTool(BaseTool):
-    """一个基于仓库根目录的评估工具。
+    """A repository-root based evaluation tool.
 
-    说明：entry_file_path 已弃用，评估总是基于当前工作树根目录执行。
-    支持可选参数：
-      - program_id (string, optional): 评估运行的标识，用于日志/制品追踪。
+    Notes: 'entry_file_path' is deprecated; evaluation always runs against the current
+    working tree root. Optional parameter:
+      - program_id (string, optional): Identifier for the evaluation run, used for logs/artifacts tracking.
     """
 
     def __init__(self, evaluator, config: ToolConfig):
@@ -51,11 +51,11 @@ class EvaluateTool(BaseTool):
         self.config = config
 
     def validate_tool_params(self, params: Dict[str, Any]) -> str | None:
-        # entry_file_path 已弃用，保留空验证
+        # 'entry_file_path' is deprecated; keep empty validation
         return None
 
     def tool_locations(self, params: Dict[str, Any]) -> List[ToolLocation]:
-        # 仓库级评估，不定位到具体文件
+        # Repository-level evaluation; does not target a specific file
         return []
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -65,7 +65,7 @@ class EvaluateTool(BaseTool):
 
         program_id = params.get("program_id", "")
 
-        # 始终使用仓库根目录进行评估
+        # Always evaluate using the repository root
         try:
             metrics = await self.evaluator.evaluate_repo(self.config.root_dir, program_id=program_id)
         except Exception as e:

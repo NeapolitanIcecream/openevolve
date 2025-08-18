@@ -52,7 +52,7 @@ def process_single_file_content(
             with open(file_path, "rb") as f:
                 encoded_content = base64.b64encode(f.read()).decode(DEFAULT_ENCODING)
             mime_type = get_specific_mime_type(file_path)
-            # OpenAI 风格：将二进制以 data URI 字符串形式返回
+            # OpenAI style: return binary as a data URI string
             data_uri = f"data:{mime_type};base64,{encoded_content}"
             return {
                 "llmContent": data_uri,

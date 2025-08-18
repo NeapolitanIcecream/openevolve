@@ -70,7 +70,7 @@ def unescape_string_for_llm_bug(input_string: str) -> str:
             '\\': '\\',
             '\n': '\n'
         }.get(captured_char, match.group(0))
-    # 使用正则匹配：一个或多个反斜杠后跟 n/t/r/单引号/双引号/反引号/反斜杠/换行
+    # Use regex: one or more backslashes followed by n/t/r/single-quote/double-quote/backtick/backslash/newline
     return re.sub(r'\\+(n|t|r|\'|"|`|\\|\n)', replace_match, input_string)
 
 def trim_pair_if_possible(target: str, pair: str, content: str, expected_replacements: int):

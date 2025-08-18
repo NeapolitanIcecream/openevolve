@@ -15,6 +15,9 @@ from .read_many_files import ReadManyFilesTool
 from .config import Config as ToolConfig
 from ..llm.base import LLMInterface
 from .evaluator import EvaluateTool
+from .glob import GlobTool
+from .grep import GrepTool
+from .ls import LSTool
 
 
 # A simple type alias for the config object for now.
@@ -140,6 +143,10 @@ class ToolRegistry:
         
         self.register_tool(ReadFileTool(config=self.tool_config))
         self.register_tool(ReadManyFilesTool(config=self.tool_config))
+        # File system discovery tools
+        self.register_tool(GlobTool(config=self.tool_config))
+        self.register_tool(GrepTool(config=self.tool_config))
+        self.register_tool(LSTool(config=self.tool_config))
         if self._evaluator is not None:
             self.register_tool(EvaluateTool(evaluator=self._evaluator, config=self.tool_config))
 
@@ -214,7 +221,7 @@ class ToolRegistry:
             if not isinstance(discovered_items, list):
                 raise TypeError("Tool discovery command must return a JSON array of tools.")
 
-            # 仅接受 OpenAI 风格：{"type":"function","function":{"name":...,"description":...,"parameters":{...}}}
+            # Only accept OpenAI-style: {"type":"function","function":{"name":...,"description":...,"parameters":{...}}}
             functions: List[Schema] = []
             for item in discovered_items:
                 if not isinstance(item, dict):
@@ -224,7 +231,7 @@ class ToolRegistry:
                     if fn.get("name"):
                         functions.append(fn)
                 elif item.get("name"):
-                    # 兼容性已移除；这里只在输入直接就是 function 对象时接受
+                    # Compatibility removed; only accept when input is directly a function object
                     functions.append(item)
 
             for func in functions:

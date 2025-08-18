@@ -157,7 +157,7 @@ def _worker_init(config_dict: Dict[str, Any], evaluation_file: str) -> None:
     _worker_registry = None
     _worker_llm = None
 
-    # 统一的会话管理（使用 PromptSampler 生成稳定系统提示）
+    # Unified session management (use PromptSampler to generate a stable system prompt)
     _worker_prompt_sampler = PromptSampler(prompt_config)
     _worker_session = ConversationSession(system_message=_worker_prompt_sampler.build_system_message())
 
@@ -193,13 +193,13 @@ def _lazy_init_worker_components():
             database=None,
         )
 
-    # 单例 ToolRegistry 与 LLM（禁用内部历史记录）
+    # Singleton ToolRegistry and LLM (internal history disabled)
     if _worker_registry is None:
         from openevolve.tools.registry import ToolRegistry
         _worker_registry = ToolRegistry(config={"root_dir": _worker_config.database.git_repo_path}, evaluator=_worker_evaluator)
 
     if _worker_llm is None:
-        # 选择写工具模型；若未指定则使用第一个模型
+        # Choose the write-tool model; use the first model if not specified
         model_cfg = None
         desired = getattr(_worker_config.llm, "write_tool_model_name", None)
         if desired:
@@ -210,9 +210,9 @@ def _lazy_init_worker_components():
         if model_cfg is None:
             model_cfg = _worker_config.llm.models[0]
         _worker_llm = OpenAILLM(model_cfg, tool_registry=_worker_registry)
-        # 绑定统一会话
+        # Attach the unified session
         _worker_llm.attach_session(_worker_session)
-        # 注册写文件工具
+        # Register the write-file tool
         _worker_registry.set_llm_client(_worker_llm)
 
 
@@ -257,7 +257,7 @@ def _run_iteration_worker(
             return SerializableResult(error=f"git checkout failed: {proc.stderr}", iteration=iteration)
 
         # ---- LLM + Tools loop (multi-iteration session) ----
-        # 绑定本迭代的根目录到 registry（更新 root_dir）
+        # Bind this iteration's root directory to the registry (update root_dir)
         assert _worker_registry is not None, "ToolRegistry is not initialized"
         assert _worker_llm is not None, "LLM is not initialized"
         if hasattr(_worker_registry, "tool_config"):
@@ -265,7 +265,7 @@ def _run_iteration_worker(
         if hasattr(_worker_registry, "config"):
             _worker_registry.config["root_dir"] = worktree_dir  # type: ignore[index]
 
-        # 由 LLM 层执行完整的工具循环并维护历史
+        # Let the LLM layer run the full tool loop and maintain history
         run_out: Dict[str, Any] = asyncio.run(
             _worker_llm.run_iteration_with_tools(
                 iteration=iteration,
@@ -278,7 +278,7 @@ def _run_iteration_worker(
         metrics: Dict[str, Any] = run_out.get("metrics") or {}
         did_evaluate: bool = bool(run_out.get("did_evaluate"))
 
-        # 仅当配置要求时强制 evaluate 之后再提交
+        # Enforce 'evaluate' before committing only if required by the configuration
         require_eval = getattr(_worker_config.evaluator, 'require_evaluate_before_commit', True)
         if require_eval and not did_evaluate:
             return SerializableResult(error="Iteration ended without calling evaluate tool", iteration=iteration)
@@ -311,7 +311,7 @@ def _run_iteration_worker(
         
         iteration_time = time.time() - iteration_start
 
-        # 会话压缩已在 LLM 层按需执行
+        # Session compression is already executed on demand in the LLM layer
         
         return SerializableResult(
             child_program_dict=child_program.to_dict(),

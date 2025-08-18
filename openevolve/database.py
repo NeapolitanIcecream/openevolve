@@ -44,11 +44,11 @@ class Program:
 
     # Program identification
     id: str
-    # 提交标识 (不再保存完整代码文本)
+    # Commit identifier (no longer store full code text)
     commit_hash: str
-    # 新增：commit 信息及其 diff
-    prompt_diff: Optional[str] = None  # 带文件名的清洗 diff，供提示词
-    hash_diff: Optional[str] = None    # 彻底清洗后的 diff，用于 MinHash
+    # Added: commit information and its diff
+    prompt_diff: Optional[str] = None  # Cleaned diff with filenames, for prompts
+    hash_diff: Optional[str] = None    # Fully cleaned diff, used for MinHash
     minhash_signature: List[int] = field(default_factory=list)
     language: str = "python"
 

@@ -171,13 +171,13 @@ class OpenEvolve:
         else:
             start_iteration = self.database.last_iteration
 
-        # 仅当数据库为空时，添加“初始 commit 个体”（commit-based）
+        # Only when the database is empty, add the "initial commit individual" (commit-based)
         should_add_initial = start_iteration == 0 and len(self.database.programs) == 0
 
         if should_add_initial:
             logger.info("Adding initial commit-based program to database")
             initial_program_id = str(uuid.uuid4())
-            # 以 root_commit 作为初始个体（与 root 的 diff 为空）
+            # Use root_commit as the initial individual (diff with root is empty)
             initial_program = Program(
                 id=initial_program_id,
                 commit_hash=self.config.database.root_commit,
@@ -310,7 +310,7 @@ class OpenEvolve:
             best_program = self.database.get_best_program()
 
         if best_program:
-            # 在 commit-based 模式下，保存最佳提交哈希
+            # In commit-based mode, save the best commit hash
             best_commit_path = os.path.join(checkpoint_path, "best_commit.txt")
             with open(best_commit_path, "w") as f:
                 f.write(str(best_program.commit_hash))
@@ -401,7 +401,7 @@ class OpenEvolve:
         best_dir = os.path.join(self.output_dir, "best")
         os.makedirs(best_dir, exist_ok=True)
 
-        # 在 commit-based 模式下，仅保存最佳提交哈希
+        # In commit-based mode, save only the best commit hash
         commit_path = os.path.join(best_dir, "best_commit.txt")
         with open(commit_path, "w") as f:
             f.write(str(program.commit_hash))
