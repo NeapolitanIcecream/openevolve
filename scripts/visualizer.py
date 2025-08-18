@@ -4,7 +4,7 @@ import glob
 import logging
 import shutil
 import re as _re
-from flask import Flask, render_template, render_template_string, jsonify
+from flask import Flask, render_template, jsonify
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,16 @@ def load_evolution_data(checkpoint_folder):
     programs_dir = os.path.join(checkpoint_folder, "programs")
     if not os.path.exists(meta_path) or not os.path.exists(programs_dir):
         logger.info(f"Missing metadata.json or programs dir in {checkpoint_folder}")
-        return {"archive": [], "nodes": [], "edges": [], "checkpoint_dir": checkpoint_folder}
+        return {
+            "archive": [],
+            "nodes": [],
+            "edges": [],
+            "checkpoint_dir": checkpoint_folder,
+            "best_program_id": None,
+            "island_best_programs": [],
+            "last_iteration": 0,
+            "island_generations": [],
+        }
     with open(meta_path) as f:
         meta = json.load(f)
 
@@ -60,8 +69,19 @@ def load_evolution_data(checkpoint_folder):
             if os.path.exists(prog_path):
                 with open(prog_path) as pf:
                     prog = json.load(pf)
+                # Normalize expected fields for commit-based evolution
+                # Note: we don't store full source code in commit-based mode
+                prog.setdefault("metrics", {})
+                prog.setdefault("parent_id", None)
+                prog.setdefault("generation", 0)
+                prog.setdefault("commit_hash", "")
+                prog.setdefault("prompt_diff", "")
+                prog.setdefault("hash_diff", "")
+                prog.setdefault("metadata", {})
+
                 prog["id"] = pid
-                prog["island"] = island_idx
+                # Prefer explicit metadata island if present; fallback to iteration island index
+                prog["island"] = prog.get("metadata", {}).get("island", island_idx)
                 nodes.append(prog)
                 id_to_program[pid] = prog
             else:
@@ -79,6 +99,11 @@ def load_evolution_data(checkpoint_folder):
         "nodes": nodes,
         "edges": edges,
         "checkpoint_dir": checkpoint_folder,
+        # Extra metadata useful for commit-based visualization
+        "best_program_id": meta.get("best_program_id"),
+        "island_best_programs": meta.get("island_best_programs", []),
+        "last_iteration": meta.get("last_iteration", 0),
+        "island_generations": meta.get("island_generations", []),
     }
 
 
@@ -112,13 +137,32 @@ def program_page(program_id):
         return "No checkpoint loaded", 500
 
     data = load_evolution_data(checkpoint_dir)
-    program_data = next((p for p in data["nodes"] if p["id"] == program_id), None)
-    program_data = {"code": "", "prompts": {}, **program_data}
-    artifacts_json = program_data.get("artifacts_json", None)
+    program_data = next((p for p in data["nodes"] if p.get("id") == program_id), None)
+
+    if program_data is None:
+        # Program not found in current checkpoint
+        return f"Program {program_id} not found in checkpoint", 404
+
+    # Enrich with defaults for commit-based view
+    # We intentionally avoid storing source code; show commit and diff instead
+    normalized = {
+        "id": program_id,
+        "metrics": {},
+        "prompts": {},
+        "commit_hash": "",
+        "prompt_diff": "",
+        "hash_diff": "",
+        "parent_id": None,
+        "generation": 0,
+        "island": program_data.get("island"),
+        **program_data,
+    }
+
+    artifacts_json = normalized.get("artifacts_json", None)
 
     return render_template(
         "program_page.html",
-        program_data=program_data,
+        program_data=normalized,
         checkpoint_dir=checkpoint_dir,
         artifacts_json=artifacts_json,
     )

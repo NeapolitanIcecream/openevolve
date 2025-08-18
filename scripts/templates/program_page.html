@@ -5,40 +5,73 @@
     <title>Program {{ program_data.id }}</title>
     <style>
         body { font-family: Arial, sans-serif; padding: 20px; }
-        /* Text wrapping for <pre> elements */
         pre {
-            background: #f0f0f0;
-            padding: 10px;
-            border-radius: 5px;
-            white-space: pre-wrap;     /* Preserve formatting, allow wrapping */
-            overflow-wrap: break-word; /* Break long words */
-        }
-        /* Text wrapping for list elements */
-        li {
+            background: #f6f8fa;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #e1e4e8;
+            white-space: pre-wrap;
             overflow-wrap: break-word;
         }
+        code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+        .kv > li { margin: 0.2em 0; }
+        details { margin: 0.6em 0 1em 0; }
+        details > summary { cursor: pointer; font-weight: bold; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+        .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef; color:#334; font-size:0.9em; border:1px solid #dde; }
+        .section { margin-top: 1.4em; }
     </style>
-</head>
+    <script>
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(function(){
+                const el = document.getElementById('copy-status');
+                if (el) { el.textContent = 'copied'; setTimeout(()=>{ el.textContent=''; }, 1000); }
+            }).catch(function(){ /* ignore */ });
+        }
+    </script>
+    </head>
 <body>
-    <h1>Program ID: {{ program_data.id }}</h1>
-    <ul>
-        <li><strong>Checkpoint:</strong> {{checkpoint_dir}}</li>
+    <h1>Program ID: <span class="mono">{{ program_data.id }}</span></h1>
+    <ul class="kv">
+        <li><strong>Checkpoint:</strong> <span class="mono">{{ checkpoint_dir }}</span></li>
         <li><strong>Island:</strong> {{ program_data.island }}</li>
         <li><strong>Generation:</strong> {{ program_data.generation }}</li>
-        <li><strong>Parent ID:</strong> {{ program_data.parent_id or 'None' }}</li>
-        <li><strong>Metrics:</strong>
-            <ul>
-                {% for key, value in program_data.metrics.items() %}
-                    <li><strong>{{ key }}:</strong> {{ value }}</li>
-                {% endfor %}
-            </ul>
+        <li><strong>Parent ID:</strong> <span class="mono">{{ program_data.parent_id or 'None' }}</span></li>
+        <li><strong>Commit:</strong> <span class="mono">{{ program_data.commit_hash or 'Unknown' }}</span>
+            {% if program_data.commit_hash %}
+                <button style="margin-left:6px;" onclick="copyToClipboard('{{ program_data.commit_hash }}')">Copy</button>
+                <span id="copy-status" class="pill"></span>
+            {% endif %}
         </li>
+    </ul>
+
+    <div class="section">
+        <h2>Metrics</h2>
+        {% if program_data.metrics %}
+        <ul>
+            {% for key, value in program_data.metrics.items() %}
+                <li><strong>{{ key }}:</strong> {{ value }}</li>
+            {% endfor %}
         </ul>
-    <h2>Code:</h2>
-    <pre>{{ program_data.code }}</pre>
-    <h2>Prompts:</h2>
-    <ul>
-        {#-- recursive “display” macro --#}
+        {% else %}
+        <p style="color:#888;">No metrics available.</p>
+        {% endif %}
+    </div>
+
+    <div class="section">
+        <h2>Commit Diff</h2>
+        <details open>
+            <summary>Prompt diff (cleaned for prompts)</summary>
+            <pre><code>{{ program_data.prompt_diff or '(empty)' }}</code></pre>
+        </details>
+        <details>
+            <summary>Full diff (for MinHash signature)</summary>
+            <pre><code>{{ program_data.hash_diff or '(empty)' }}</code></pre>
+        </details>
+    </div>
+
+    <div class="section">
+        <h2>Prompts</h2>
         {% macro display(val) %}
         {% if val is mapping %}
             <ul>
@@ -59,7 +92,7 @@
             <pre>{{ val|e }}</pre>
         {% endif %}
         {% endmacro %}
-        {#-- loop over every prompts --#}
+        {% if program_data.prompts %}
         <div class="prompts">
         {% for key, value in program_data.prompts.items() %}
             <section>
@@ -68,10 +101,16 @@
             </section>
         {% endfor %}
         </div>
-    </ul>
+        {% else %}
+        <p style="color:#888;">No prompts logged.</p>
+        {% endif %}
+    </div>
+
     {% if artifacts_json %}
-    <h2>Artifacts:</h2>
-    <pre style="white-space: pre-wrap; word-break: break-word;">{{ artifacts_json }}</pre>
+    <div class="section">
+        <h2>Artifacts</h2>
+        <pre style="white-space: pre-wrap; word-break: break-word;">{{ artifacts_json }}</pre>
+    </div>
     {% endif %}
 </body>
 </html>

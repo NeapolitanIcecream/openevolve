@@ -1,36 +1,38 @@
-# OpenEvolve Island-Based Evolution Configuration Examples
-# Different configurations for various use cases
+# OpenEvolve Island-Based Evolution Profiles (Commit-Based)
+# Predefined database profiles to plug into any config.
 
 # Configuration for Maximum Diversity (Many Islands, Frequent Migration)
 # Use this when you want to explore the search space thoroughly
 # Good for: Complex problems, avoiding local optima, long runs
 max_diversity:
   database:
-    num_islands: 10                   # More islands = more diversity
-    migration_interval: 25            # More frequent migration
-    migration_rate: 0.2               # Higher migration rate
+    num_islands: 10                    # More islands = more diversity
+    migration_interval: 25             # More frequent migration
+    migration_rate: 0.2                # Higher migration rate
     population_size: 1000
     archive_size: 200
+    signature_similarity_threshold: 0.85  # Encourage broader exploration
 
-# Configuration for Focused Exploration (Few Islands, Rare Migration)  
+# Configuration for Focused Exploration (Few Islands, Rare Migration)
 # Use this when you want deeper exploration within each island
 # Good for: Problems with clear structure, shorter runs
 focused_exploration:
   database:
-    num_islands: 3                    # Fewer islands = deeper exploration
-    migration_interval: 100           # Less frequent migration
-    migration_rate: 0.05              # Lower migration rate
+    num_islands: 3                     # Fewer islands = deeper exploration
+    migration_interval: 100            # Less frequent migration
+    migration_rate: 0.05               # Lower migration rate
     population_size: 500
     archive_size: 50
+    signature_similarity_threshold: 0.75  # Allow closer variants to compete
 
 # Configuration for Balanced Approach (Default Settings)
 # Use this as a starting point for most problems
 # Good for: General use, medium-length runs
 balanced:
   database:
-    num_islands: 5                    # Balanced number of islands
-    migration_interval: 50            # Moderate migration frequency
-    migration_rate: 0.1               # Moderate migration rate
+    num_islands: 5                     # Balanced number of islands
+    migration_interval: 50             # Moderate migration frequency
+    migration_rate: 0.1                # Moderate migration rate
     population_size: 1000
     archive_size: 100
 
@@ -50,10 +52,10 @@ quick_exploration:
 # Good for: Complex optimization, long evolutionary runs
 large_scale:
   database:
-    num_islands: 15                   # Many islands for parallel exploration
-    migration_interval: 75            # Balanced migration timing
-    migration_rate: 0.08              # Conservative migration rate
-    population_size: 2000             # Large populations
+    num_islands: 15                    # Many islands for parallel exploration
+    migration_interval: 75             # Balanced migration timing
+    migration_rate: 0.08               # Conservative migration rate
+    population_size: 2000              # Large populations
     archive_size: 300
 
 # Guidelines for choosing parameters:
@@ -72,6 +74,10 @@ large_scale:
 #   - Higher values = faster knowledge propagation
 #   - Lower values = preserve island diversity longer
 #   - Recommended: 0.05-0.2 (5%-20%)
+#
+# signature_similarity_threshold:
+#   - Increase to penalize near-duplicates and push exploration
+#   - Decrease to allow finer local search around promising commits
 #
 # Rule of thumb:
 #   - Complex problems → More islands, less frequent migration

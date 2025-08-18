@@ -1,73 +1,96 @@
-# OpenEvolve Configuration Files
+# OpenEvolve Configuration (Commit-Based Evolution)
 
-This directory contains configuration files for OpenEvolve with examples for different use cases.
+This directory contains configuration templates and examples for the commit-based evolution workflow.
 
-## Configuration Files
+## Files
 
 ### `default_config.yaml`
-The main configuration file containing all available options with sensible defaults. This file includes:
-- Complete documentation for all configuration parameters
-- Default values for all settings
-- **Island-based evolution parameters** for proper evolutionary diversity
+Complete template with all supported options and sane defaults:
+- LLM ensemble with shared `defaults` and per-model weights
+- Long-session/KV-cache friendly prompt settings
+- Commit-based evolution (git) parameters and island model
+- Evaluator settings including commit gating
 
-Use this file as a template for your own configurations.
+Use this file as a starting point for your own runs.
 
 ### `island_config_example.yaml`
-A practical example configuration demonstrating proper island-based evolution setup. Shows:
-- Recommended island settings for most use cases
-- Balanced migration parameters
-- Complete working configuration
+Ready-to-run example showcasing a balanced island configuration plus commit-based settings.
 
 ### `island_examples.yaml`
-Multiple example configurations for different scenarios:
-- **Maximum Diversity**: Many islands, frequent migration
-- **Focused Exploration**: Few islands, rare migration  
-- **Balanced Approach**: Default recommended settings
-- **Quick Exploration**: Small-scale rapid testing
-- **Large-Scale Evolution**: Complex optimization runs
+Profiles for different exploration strategies you can merge into your config:
+- Maximum Diversity (broad exploration)
+- Focused Exploration (deep local search)
+- Balanced (recommended default)
+- Quick Exploration (small-scale prototyping)
+- Large-Scale (extensive search)
 
-Includes guidelines for choosing parameters based on your problem characteristics.
-
-## Island-Based Evolution Parameters
-
-The key new parameters for proper evolutionary diversity are:
+## Key Commit-Based Parameters
 
 ```yaml
 database:
-  num_islands: 5                      # Number of separate populations
-  migration_interval: 50              # Migrate every N generations  
-  migration_rate: 0.1                 # Fraction of top programs to migrate
+  # Baseline used to compute diffs for signatures and snapshots
+  root_commit: "HEAD"
+
+  # Natural language goal for the run; influences prompts and selection
+  evolution_target: "Improve correctness and performance while maintaining API."
+
+  # Controls how aggressively we treat two commits as near-duplicates
+  signature_similarity_threshold: 0.8
 ```
 
-### Parameter Guidelines
+## Session Management (KV-cache Friendly)
 
-- **num_islands**: 3-10 for most problems (more = more diversity)
-- **migration_interval**: 25-100 generations (higher = more independence)
-- **migration_rate**: 0.05-0.2 (5%-20%, higher = faster knowledge sharing)
+```yaml
+prompt:
+  session_max_tokens: 120000
+  session_compress_threshold: 80000
+  recent_history_tokens: 30000
+  compression_model_name: null
+```
 
-### When to Use What
+## LLM Ensemble
 
-- **Complex problems** → More islands, less frequent migration
-- **Simple problems** → Fewer islands, more frequent migration
-- **Long runs** → More islands to maintain diversity
-- **Short runs** → Fewer islands for faster convergence
+```yaml
+llm:
+  defaults:
+    api_base: "https://api.openai.com/v1"
+    api_key: null
+  models:
+    - name: "gpt-4o-mini"
+      weight: 0.8
+    - name: "gpt-4o"
+      weight: 0.2
+  write_tool_model_name: null
+```
 
-## Usage
+## Island Model
 
-Copy any of these files as a starting point for your configuration:
+```yaml
+database:
+  num_islands: 5
+  migration_interval: 50
+  migration_rate: 0.1
+```
+
+Guidelines:
+- num_islands: 3-10 for most problems (more = more diversity)
+- migration_interval: 25-100 (higher = more independent evolution)
+- migration_rate: 0.05-0.2 (higher = faster knowledge sharing)
+
+## CLI Usage
+
+Run OpenEvolve using your repository and evaluator:
 
 ```bash
-cp configs/default_config.yaml my_config.yaml
-# Edit my_config.yaml for your specific needs
+python -m openevolve.cli /path/to/repo /path/to/evaluator.py \
+  --config configs/default_config.yaml \
+  --root-commit <baseline_sha_or_branch> \
+  --evolution-target "Improve correctness and performance while maintaining API." \
+  --write-tool-model gpt-4o-mini
 ```
 
-Then use with OpenEvolve:
+Alternatively, use only the config file (set `database.root_commit` etc. inside YAML):
 
-```python
-from openevolve import OpenEvolve
-evolve = OpenEvolve(
-    initial_program_path="program.py",
-    evaluation_file="evaluator.py", 
-    config_path="my_config.yaml"
-)
+```bash
+python -m openevolve.cli /path/to/repo /path/to/evaluator.py --config my_config.yaml
 ```

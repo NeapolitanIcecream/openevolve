@@ -31,8 +31,16 @@ export function showSidebarContent(d, fromHover = false) {
     let tabHtml = '';
     let tabContentHtml = '';
     let tabNames = [];
+    // In commit-based evolution, full code is not stored; keep placeholder only if present
     if (d.code && typeof d.code === 'string' && d.code.trim() !== '') tabNames.push('Code');
-    if ((d.prompts && typeof d.prompts === 'object' && Object.keys(d.prompts).length > 0) || (d.artifacts_json && typeof d.artifacts_json === 'object' && Object.keys(d.artifacts_json).length > 0)) tabNames.push('Prompts');
+    // Add Commit tab if commit info exists
+    if ((d.commit_hash && typeof d.commit_hash === 'string' && d.commit_hash.trim() !== '') || (d.prompt_diff && d.prompt_diff.trim() !== '') || (d.hash_diff && d.hash_diff.trim() !== '')) {
+        tabNames.push('Commit');
+    }
+    // Prompts/Artifacts selection: show if either has content
+    const hasPrompts = !!(d.prompts && typeof d.prompts === 'object' && Object.keys(d.prompts).length > 0);
+    const hasArtifacts = !!(d.artifacts_json && (typeof d.artifacts_json === 'string' ? d.artifacts_json.trim() !== '' : (typeof d.artifacts_json === 'object' && Object.keys(d.artifacts_json).length > 0)));
+    if (hasPrompts || hasArtifacts) tabNames.push('Prompts');
     const children = allNodeData.filter(n => n.parent_id === d.id);
     if (children.length > 0) tabNames.push('Children');
 
@@ -70,11 +78,16 @@ export function showSidebarContent(d, fromHover = false) {
                     }
                 }
             }
-            // Artifacts
+            // Artifacts (stringified JSON or object)
             if (d.artifacts_json) {
                 const optLabel = `artifacts`;
                 promptOptions.push(optLabel);
-                promptMap[optLabel] = d.artifacts_json;
+                try {
+                    const parsed = (typeof d.artifacts_json === 'string') ? JSON.parse(d.artifacts_json) : d.artifacts_json;
+                    promptMap[optLabel] = typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : String(parsed);
+                } catch (e) {
+                    promptMap[optLabel] = (typeof d.artifacts_json === 'string') ? d.artifacts_json : JSON.stringify(d.artifacts_json, null, 2);
+                }
             }
             // Get last selected prompt from localStorage, or default to first
             let lastPromptKey = localStorage.getItem('sidebarPromptSelect') || promptOptions[0] || '';
@@ -90,6 +103,24 @@ export function showSidebarContent(d, fromHover = false) {
             let promptVal = promptMap[lastPromptKey];
             let promptHtml = `<pre class="sidebar-pre">${promptVal ?? ''}</pre>`;
             return selectHtml + promptHtml;
+        }
+        if (tabName === 'Commit') {
+            const commitHash = (d.commit_hash && typeof d.commit_hash === 'string') ? d.commit_hash : '';
+            const promptDiff = (d.prompt_diff && typeof d.prompt_diff === 'string') ? d.prompt_diff : '';
+            const hashDiff = (d.hash_diff && typeof d.hash_diff === 'string') ? d.hash_diff : '';
+            return `
+                <div>
+                    <div style="margin-bottom:0.6em;"><b>Commit:</b> <span class="mono">${commitHash || '(unknown)'}</span></div>
+                    <details open>
+                        <summary>Prompt diff</summary>
+                        <pre class="sidebar-pre">${promptDiff || '(empty)'}</pre>
+                    </details>
+                    <details>
+                        <summary>Full diff</summary>
+                        <pre class="sidebar-pre">${hashDiff || '(empty)'}</pre>
+                    </details>
+                </div>
+            `;
         }
         if (tabName === 'Children') {
             const metric = (document.getElementById('metric-select') && document.getElementById('metric-select').value) || 'combined_score';
@@ -138,7 +169,8 @@ export function showSidebarContent(d, fromHover = false) {
             <b>Program ID:</b> ${d.id}<br>
             <b>Island:</b> ${d.island}<br>
             <b>Generation:</b> ${d.generation}<br>
-            <b>Parent ID:</b> <a href="#" class="parent-link" data-parent="${d.parent_id || ''}">${d.parent_id || 'None'}</a>${parentIslandHtml}<br><br>
+            <b>Parent ID:</b> <a href="#" class="parent-link" data-parent="${d.parent_id || ''}">${d.parent_id || 'None'}</a>${parentIslandHtml}<br>
+            <b>Commit:</b> <span class="mono">${(d.commit_hash && typeof d.commit_hash === 'string' ? d.commit_hash : '') || 'Unknown'}</span><br><br>
             <b>Metrics:</b><br>${formatMetrics(d.metrics)}<br><br>
             ${tabHtml}${tabContentHtml}
         </div>`;

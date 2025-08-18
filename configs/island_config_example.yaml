@@ -1,52 +1,68 @@
-# OpenEvolve Island-Based Evolution Configuration
-# This configuration demonstrates the proper use of island-based evolution
+# OpenEvolve Island-Based Evolution (Commit-Based) - Example
+# A practical, ready-to-run example showcasing island settings together with
+# commit-based evolution parameters.
 
 # General settings
 max_iterations: 1000
 checkpoint_interval: 100
 log_level: "INFO"
 
-# LLM configuration
+# LLM configuration (ensemble)
 llm:
-  primary_model: "gemini-2.0-flash-lite"
-  primary_model_weight: 0.8
-  secondary_model: "gemini-2.0-flash"
-  secondary_model_weight: 0.2
-  temperature: 0.7
-  top_p: 0.95
-  max_tokens: 4096
+  defaults:
+    api_base: "https://api.openai.com/v1"
+    api_key: null
+    temperature: 0.7
+    top_p: 0.95
+    max_tokens: 4096
+  models:
+    - name: "gpt-4o-mini"
+      weight: 0.8
+    - name: "gpt-4o"
+      weight: 0.2
+  write_tool_model_name: "gpt-4o-mini"   # Model used for multi-file writes
+  tool_loop_max_steps: 30
 
-# Database configuration with proper island settings
+# Prompt configuration (KV-cache friendly session)
+prompt:
+  system_message: "You are an expert coder evolving a repository through safe, incremental commits."
+  num_top_programs: 3
+  num_diverse_programs: 2
+  use_template_stochasticity: true
+  include_artifacts: true
+  max_artifact_bytes: 20480
+  session_max_tokens: 120000
+  session_compress_threshold: 80000
+  recent_history_tokens: 30000
+
+# Database configuration with island settings and commit-based parameters
 database:
+  # Git baseline and goal
+  root_commit: "HEAD"                   # Replace with a stable baseline commit if desired
+  evolution_target: "Improve correctness and performance while maintaining the public API."
+  signature_similarity_threshold: 0.82  # Slightly stricter similarity control
+
+  # Population and islands
   population_size: 500
   archive_size: 100
-  
-  # Island-based evolution settings
-  num_islands: 5                    # Number of separate populations
-  migration_interval: 50            # Migrate every 50 generations
-  migration_rate: 0.1               # Migrate 10% of top programs
-  
+  num_islands: 5                        # Separate populations to maintain diversity
+  migration_interval: 50                # Migrate every 50 generations
+  migration_rate: 0.1                   # Migrate 10% of top programs
+
   # Selection parameters
   elite_selection_ratio: 0.1
   exploration_ratio: 0.3
   exploitation_ratio: 0.7
-  # Note: diversity_metric fixed to "edit_distance"
-  
-  # Feature map dimensions for MAP-Elites
-  # Default if not specified: ["complexity", "diversity"]
-  # Comment out the line below to use the defaults
-  # feature_dimensions: ["complexity", "diversity"]
-  feature_bins: 10
-  # Can also use per-dimension bins:
-  # feature_bins:
-  #   performance: 20
-  #   correctness: 10
 
-# Prompt configuration
-prompt:
-  num_top_programs: 3
-  num_diverse_programs: 2
-  use_template_stochasticity: true
+  # Feature map (MAP-Elites)
+  feature_dimensions:
+    - "complexity"
+    - "diversity"
+  feature_bins: 10
+
+  # Git identify
+  git_user_name: "OpenEvolve"
+  git_user_email: "openevolve@example.com"
 
 # Evaluator configuration
 evaluator:
@@ -54,8 +70,4 @@ evaluator:
   max_retries: 3
   cascade_evaluation: true
   parallel_evaluations: 4
-
-# Evolution settings
-diff_based_evolution: true
-allow_full_rewrites: false
-max_code_length: 10000
+  require_evaluate_before_commit: true
