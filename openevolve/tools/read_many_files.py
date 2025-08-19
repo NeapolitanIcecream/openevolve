@@ -4,7 +4,7 @@ Implementation of the ReadManyFiles tool.
 
 import glob
 import os
-from typing import Any, Dict, List, Set, Union
+from typing import Any, Dict, List, Set
 import pathspec
 
 from .base import BaseTool, Icon, ToolResult
@@ -52,7 +52,6 @@ DEFAULT_EXCLUDES: List[str] = [
     "**/*.odp",
     "**/.DS_Store",
     "**/.env",
-    "**/GEMINI.md",
 ]
 
 DEFAULT_OUTPUT_SEPARATOR_FORMAT = "--- {filePath} ---"
@@ -121,8 +120,6 @@ class ReadManyFilesTool(BaseTool):
         respect_git_ignore = ff_opts.get(
             "respect_git_ignore", DEFAULT_FILE_FILTERING_OPTIONS.respect_git_ignore
         )
-        # Deprecated option, ignored
-        respect_gemini_ignore = False
 
         effective_excludes = (DEFAULT_EXCLUDES + exclude) if use_default_excludes else exclude
         search_patterns = input_patterns + include
@@ -149,7 +146,7 @@ class ReadManyFilesTool(BaseTool):
 
         # Filter based on ignore files
         final_filtered_entries = self.file_service.filter_files(
-            included_files, respect_git_ignore, respect_gemini_ignore
+            included_files, respect_git_ignore
         )
 
         content_parts: List[str] = []

@@ -63,8 +63,6 @@ class ReadFileTool(BaseTool):
         if params.get("limit") is not None and params["limit"] <= 0:
             return "Limit must be a positive number"
 
-        # Gemini ignore is deprecated; no longer blocks access
-
         return None
 
     def get_description(self, params: Dict[str, Any]) -> str:

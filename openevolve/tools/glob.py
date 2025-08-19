@@ -101,7 +101,7 @@ class GlobTool(BaseTool):
         # Filter files via helper to respect .gitignore
         filtered_files = [
             f
-            for f in self.file_service.filter_files(list(files), respect_git_ignore, False)
+            for f in self.file_service.filter_files(list(files), respect_git_ignore)
             if not spec.match_file(os.path.relpath(f, self.config.root_dir))
         ]
 

@@ -1,0 +1,3 @@
+[submodule "openevolve-example"]
+	path = openevolve-example
+	url = https://github.com/NeapolitanIcecream/openevolve-example.git

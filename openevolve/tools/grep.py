@@ -125,7 +125,7 @@ class GrepTool(BaseTool):
             for f in files
             if not spec.match_file(os.path.relpath(f, self.config.root_dir))
         ]
-        filtered = self.file_service.filter_files(not_excluded, respect_git_ignore, False)
+        filtered = self.file_service.filter_files(not_excluded, respect_git_ignore)
         return sorted(filtered)
 
     def _compile_regex(self, pattern: str, case_insensitive: bool, multiline: bool) -> re.Pattern:
