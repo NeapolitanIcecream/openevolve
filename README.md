@@ -180,6 +180,39 @@ python scripts/visualizer.py
 python scripts/visualizer.py --path /repo/openevolve_output/checkpoints/checkpoint_1000
 ```
 
+## Maintenance / Cleanup
+
+Use the cleanup utility to remove branches and objects created during evolution when a run is finished or you want to reclaim local space:
+
+```bash
+# Remove all evolution branches (default prefix oe/it_) and run Git GC (dry-run by default)
+openevolve-clean --repo /abs/path/to/repo --all
+
+# Actually execute (non dry-run)
+openevolve-clean --repo /abs/path/to/repo --all --yes
+
+# Keep a specific commit (if no evolution branch has this commit as HEAD, a keep branch will be created) and delete other evolution branches
+openevolve-clean --repo /repo --keep <commit_sha> --yes
+
+# Options
+# - Custom evolution branch prefix
+openevolve-clean --repo /repo --all --prefix oe/it_ --yes
+# - Remove .openevolve/worktrees (enabled by default; use --no-remove-worktrees to disable)
+openevolve-clean --repo /repo --all --no-remove-worktrees --yes
+# - Remove the output directory
+openevolve-clean --repo /repo --all --remove-output --yes
+# - Tag the kept commit
+openevolve-clean --repo /repo --keep <sha> --tag openevolve/selected --yes
+# - Also delete matching branches on a remote (must explicitly provide remote)
+openevolve-clean --repo /repo --all --remote origin --yes
+```
+
+Notes:
+- Branches are matched by the evolution branch prefix (default `oe/it_`).
+- In `--keep <commit>` mode, any evolution branch whose HEAD equals the commit is preserved; if none, a new `oe/keep/<short_sha>` branch is created pointing at the commit. You can add `--tag` to create/update a tag for extra safety.
+- Dry-run by default. Add `--yes` to actually apply changes; use `--dry-run` to force a preview.
+- Cleanup removes worktrees under `.openevolve/worktrees` first, then deletes branches, and finally runs `git gc` to reclaim objects.
+
 ## FAQ
 
 - Do I need a clean Git repo? Yes. The system manages per-worker worktrees and will hard-reset them each iteration. Your main repository is not modified except for commits the agent creates.

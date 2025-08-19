@@ -49,6 +49,7 @@ disallow_incomplete_defs = true
 
 [project.scripts]
 openevolve-run = "openevolve.cli:main"
+openevolve-clean = "openevolve.cleanup:main"
 
 [tool.setuptools.packages.find]
 include = ["openevolve*"]
