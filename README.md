@@ -174,7 +174,6 @@ Under `<repo>/openevolve_output/` the system saves:
 Interactive web UI to browse the evolution tree:
 
 ```bash
-pip install -r scripts/requirements.txt
 python scripts/visualizer.py
 # or with a specific checkpoint
 python scripts/visualizer.py --path /repo/openevolve_output/checkpoints/checkpoint_1000
