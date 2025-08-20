@@ -18,6 +18,7 @@ from .evaluator import EvaluateTool
 from .glob import GlobTool
 from .grep import GrepTool
 from .ls import LSTool
+from .lint_file import LintFileTool
 
 
 # A simple type alias for the config object for now.
@@ -147,6 +148,7 @@ class ToolRegistry:
         self.register_tool(GlobTool(config=self.tool_config))
         self.register_tool(GrepTool(config=self.tool_config))
         self.register_tool(LSTool(config=self.tool_config))
+        self.register_tool(LintFileTool(config=self.tool_config))
         if self._evaluator is not None:
             self.register_tool(EvaluateTool(evaluator=self._evaluator, config=self.tool_config))
 

@@ -21,6 +21,7 @@ dependencies = [
     "pathspec>=0.12.1",
     "diff-match-patch>=20241021",
     "datasketch>=1.6.5",
+    "ruff>=0.12.9",
 ]
 
 [project.optional-dependencies]
