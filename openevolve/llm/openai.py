@@ -371,6 +371,7 @@ class OpenAILLM(LLMInterface):
 
         metrics: Dict[str, Any] = {}
         did_evaluate = False
+        commit_message: Optional[str] = None
 
         for _ in range(max_steps):
             tools = self.tool_registry.get_tool_specs()
@@ -415,19 +416,33 @@ class OpenAILLM(LLMInterface):
                         self._session.append_tool_result(tc.id, tool_name, f"Error: Unknown tool '{tool_name}'")
                         continue
 
+                    executed_ok = True
+                    result = None
                     try:
                         result = await tool.execute(params)
                         tool_output_str = result.llm_content if hasattr(result, "llm_content") else "(no output)"
                     except Exception as e:
+                        executed_ok = False
                         tool_output_str = f"Error executing tool '{tool_name}': {e}"
 
                     self._session.append_tool_result(tc.id, tool_name, tool_output_str)
 
-                    if tool_name == "evaluate":
+                    if tool_name == "submit":
+                        # Parse JSON from tool output: {"metrics": {...}, "commit_message": "..."}
                         try:
-                            metrics = json.loads(tool_output_str) if isinstance(tool_output_str, str) else {}
+                            if executed_ok and isinstance(tool_output_str, str):
+                                parsed = json.loads(tool_output_str)
+                                if isinstance(parsed, dict):
+                                    maybe_metrics = parsed.get("metrics")
+                                    if isinstance(maybe_metrics, dict):
+                                        metrics = maybe_metrics
+                                    maybe_msg = parsed.get("commit_message")
+                                    if isinstance(maybe_msg, str) and maybe_msg.strip():
+                                        commit_message = maybe_msg.strip()
                         except Exception:
-                            metrics = {}
+                            # Do not break flow on parse errors
+                            pass
+
                         self._session.mark_evaluated()
                         did_evaluate = True
                         break
@@ -450,4 +465,4 @@ class OpenAILLM(LLMInterface):
         except Exception as e:
             logger.debug(f"Session compression skipped or failed: {e}")
 
-        return {"metrics": metrics, "did_evaluate": did_evaluate}
+        return {"metrics": metrics, "did_evaluate": did_evaluate, "commit_message": commit_message}

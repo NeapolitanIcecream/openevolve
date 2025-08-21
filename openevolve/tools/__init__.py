@@ -7,3 +7,4 @@ from .grep import GrepTool
 from .ls import LSTool
 from .registry import ToolRegistry
 from .lint_file import LintFileTool
+from .submit import SubmitTool

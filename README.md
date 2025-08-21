@@ -9,7 +9,7 @@ This fork modernizes OpenEvolve into a full code agent that performs commit-base
 - Commit is the unit of evolution: each organism is a Git commit that may modify multiple files
 - Fast similarity via MinHash on cleaned diffs from a configurable root commit
 - KV-cache-friendly long sessions: stable system prefix, incremental per-iteration context, on-demand compression
-- Flexible on-the-fly tool invocation: read, edit, glob/grep, list, and evaluate; evaluator is a tool
+- Flexible on-the-fly tool invocation: read, edit, glob/grep, ls, and submit; evaluator is wrapped as a tool
 - True parallelism using per-worker Git worktrees and a process pool
 - MAP-Elites with island model for quality-diversity; periodic migration across islands
 
@@ -17,7 +17,7 @@ This fork modernizes OpenEvolve into a full code agent that performs commit-base
 
 1. Sampling: From the current island, sample a parent plus diverse inspirations from the ProgramDatabase (MAP-Elites + islands)
 2. Prompt/session: A stable system message (KV-cache) is kept; per-iteration context includes goal, parent/inspiration diffs, and parent metrics
-3. Tool loop: The LLM uses built-in tools to read and edit files, then calls the evaluator tool once to finish the iteration
+3. Tool loop: The LLM uses built-in tools to read and edit files, then calls the submit tool once (with commit_message) to finish the iteration
 4. Commit: Changes in the dedicated worktree are committed; metrics may be summarized in the commit message
 5. Update DB: ProgramDatabase derives cleaned diffs, MinHash signatures, feature coordinates, and updates MAP-Elites and island bests
 6. Migration/checkpointing: Periodic migration maintains diversity; checkpoints save DB state and the best commit
@@ -26,7 +26,7 @@ This fork modernizes OpenEvolve into a full code agent that performs commit-base
 
 - Commit-based evolution with Git worktrees and safe isolation
 - KV-cache-aware long sessions with on-demand compression
-- LLM tool loop with: edit, read_file, read_many_files, glob, grep, ls, evaluate
+- LLM tool loop with: edit, read_file, read_many_files, glob, grep, ls, submit
 - MAP-Elites + island model (quality-diversity); default feature dimensions: complexity and diversity
 - MinHash-based diversity/similarity; configurable signature parameters
 - Artifacts side-channel for rich execution feedback
@@ -50,7 +50,7 @@ export OPENAI_API_BASE=https://your-provider-endpoint/v1
 
 ## Quick Start
 
-Prepare a Git repository containing the code you want to evolve, and an evaluator script exposing `evaluate(repo_root)` (or `evaluate()` with cwd set by the system). The evaluator must return a dictionary of metrics; for best results include a `combined_score`.
+Prepare a Git repository containing the code you want to evolve, and an evaluator script exposing `evaluate(repo_root)` (or `evaluate()` with cwd set by the system). The evaluator must return a dictionary of metrics; for best results include a `combined_score`. The LLM will use the `submit` tool to trigger evaluation and provide its `commit_message`.
 
 ### CLI
 
@@ -137,7 +137,7 @@ database:
   feature_bins: 10
   minhash_num_perm: 64
   minhash_shingle_len: 5
-  commit_message_template: "OpenEvolve iteration {iteration} {metrics}"
+  commit_message_template: "OpenEvolve iteration {iteration} {commit_message} {metrics}"
   commit_message_max_metrics: 6
 
 evaluator:
@@ -158,7 +158,7 @@ Notes:
 - `read_file` / `read_many_files`: Read file contents under the worktree root
 - `glob`, `grep`, `ls`: Discover files and search code
 - `edit`: Make safe, minimal edits to files (used to implement multi-file commits)
-- `evaluate`: Run your evaluator on the current worktree; returns metrics as JSON and ends the iteration
+- `submit`: Run your evaluator on the current worktree and return `{metrics, commit_message}` as JSON; ends the iteration
 
 The tool registry lives under `openevolve/tools`. The LLM chooses tools freely; you should avoid dynamically adding/removing tool definitions mid-session to preserve KV cache hits.
 

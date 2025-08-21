@@ -125,7 +125,7 @@ database:
   minhash_shingle_len: 5
 
   # Commit message and artifact snapshot
-  commit_message_template: "OpenEvolve iteration {iteration} {metrics}"
+  commit_message_template: "OpenEvolve iteration {iteration} {commit_message} {metrics}"
   commit_message_max_metrics: 6
   artifact_snapshot_programs_limit: 100
 

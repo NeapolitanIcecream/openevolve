@@ -14,7 +14,7 @@ from .read_file import ReadFileTool
 from .read_many_files import ReadManyFilesTool
 from .config import Config as ToolConfig
 from ..llm.base import LLMInterface
-from .evaluator import EvaluateTool
+from .submit import SubmitTool
 from .glob import GlobTool
 from .grep import GrepTool
 from .ls import LSTool
@@ -150,7 +150,7 @@ class ToolRegistry:
         self.register_tool(LSTool(config=self.tool_config))
         self.register_tool(LintFileTool(config=self.tool_config))
         if self._evaluator is not None:
-            self.register_tool(EvaluateTool(evaluator=self._evaluator, config=self.tool_config))
+            self.register_tool(SubmitTool(evaluator=self._evaluator, config=self.tool_config))
 
     def set_llm_client(self, llm_client: LLMInterface):
         """Sets the LLM client and re-registers tools that require it."""

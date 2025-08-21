@@ -277,20 +277,30 @@ def _run_iteration_worker(
         )
         metrics: Dict[str, Any] = run_out.get("metrics") or {}
         did_evaluate: bool = bool(run_out.get("did_evaluate"))
+        provided_commit_message: Optional[str] = run_out.get("commit_message")
 
-        # Enforce 'evaluate' before committing only if required by the configuration
+        # Enforce 'submit' before committing only if required by the configuration
         require_eval = getattr(_worker_config.evaluator, 'require_evaluate_before_commit', True)
         if require_eval and not did_evaluate:
-            return SerializableResult(error="Iteration ended without calling evaluate tool", iteration=iteration)
+            return SerializableResult(error="Iteration ended without calling submit tool", iteration=iteration)
 
+        # Always use the template; include agent-provided commit_message field
         max_metrics = getattr(_worker_config.database, 'commit_message_max_metrics', 6)
         metrics_list = [
             f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
             for k, v in (metrics or {}).items()
         ][: max(0, max_metrics)]
         commit_metrics = " ".join(metrics_list)
-        template = getattr(_worker_config.database, 'commit_message_template', 'OpenEvolve iteration {iteration} {metrics}')
-        commit_msg = template.format(iteration=iteration, metrics=commit_metrics).strip()
+        template = getattr(
+            _worker_config.database,
+            'commit_message_template',
+            'OpenEvolve iteration {iteration} {commit_message} {metrics}'
+        )
+        commit_msg = template.format(
+            iteration=iteration,
+            metrics=commit_metrics,
+            commit_message=(provided_commit_message or '').strip(),
+        ).strip()
         from openevolve.utils.git_utils import create_commit_from_worktree
         child_hash = create_commit_from_worktree(worktree_dir, commit_msg)
 

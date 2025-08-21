@@ -37,7 +37,8 @@ class PromptSampler:
             return configured
         return (
             "You are an expert software agent operating inside a git worktree. "
-            "Use the tools to read files, make minimal safe edits, and finally call 'evaluate' once to finish an iteration. "
+            "Use the tools to read files, make minimal safe edits, and finally call 'submit' once to finish an iteration, "
+            "providing a concise 'commit_message' describing your changes. "
             "Always use absolute paths under the provided root, avoid destructive changes, and keep edits consistent."
         )
 
