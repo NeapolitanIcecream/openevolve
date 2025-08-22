@@ -5,7 +5,8 @@ Service for handling file discovery and filtering based on ignore files.
 import os
 from typing import List
 
-# The user needs to install this dependency: pip install pathspec
+# Dependency: pathspec
+# Prefer using uv to install: `uv add pathspec` (or `pip install pathspec`)
 import pathspec
 
 from .config import Config

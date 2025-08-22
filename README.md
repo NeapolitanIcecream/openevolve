@@ -34,9 +34,24 @@ This fork modernizes OpenEvolve into a full code agent that performs commit-base
 
 ## Installation
 
+Via uv (recommended):
+
 ```bash
 git clone https://github.com/NeapolitanIcecream/openevolve.git
 cd openevolve
+
+# Install uv (macOS):
+#   brew install uv
+# Or via shell:
+#   curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create a virtual env and install project dependencies
+uv sync --all-projects
+```
+
+Alternative:
+
+```bash
 pip install -e .
 ```
 
@@ -55,7 +70,7 @@ Prepare a Git repository containing the code you want to evolve, and an evaluato
 ### CLI
 
 ```bash
-python openevolve-run.py /absolute/path/to/repo /absolute/path/to/evaluator.py \
+uv run openevolve-run /absolute/path/to/repo /absolute/path/to/evaluator.py \
   --config /absolute/path/to/config.yaml \
   --iterations 200
 ```
@@ -72,7 +87,7 @@ Useful flags (override config at runtime):
 Resume from a checkpoint directory created under `<repo>/openevolve_output/checkpoints`:
 
 ```bash
-python openevolve-run.py /repo /evaluator.py --checkpoint /repo/openevolve_output/checkpoints/checkpoint_500 --iterations 100
+uv run openevolve-run /repo /evaluator.py --checkpoint /repo/openevolve_output/checkpoints/checkpoint_500 --iterations 100
 ```
 
 ### Python API
@@ -174,9 +189,9 @@ Under `<repo>/openevolve_output/` the system saves:
 Interactive web UI to browse the evolution tree:
 
 ```bash
-python scripts/visualizer.py
+uv run scripts/visualizer.py
 # or with a specific checkpoint
-python scripts/visualizer.py --path /repo/openevolve_output/checkpoints/checkpoint_1000
+uv run scripts/visualizer.py --path /repo/openevolve_output/checkpoints/checkpoint_1000
 ```
 
 ## Maintenance / Cleanup
@@ -185,25 +200,25 @@ Use the cleanup utility to remove branches and objects created during evolution 
 
 ```bash
 # Remove all evolution branches (default prefix oe/it_) and run Git GC (dry-run by default)
-openevolve-clean --repo /abs/path/to/repo --all
+uv run openevolve-clean --repo /abs/path/to/repo --all
 
 # Actually execute (non dry-run)
-openevolve-clean --repo /abs/path/to/repo --all --yes
+uv run openevolve-clean --repo /abs/path/to/repo --all --yes
 
 # Keep a specific commit (if no evolution branch has this commit as HEAD, a keep branch will be created) and delete other evolution branches
-openevolve-clean --repo /repo --keep <commit_sha> --yes
+uv run openevolve-clean --repo /repo --keep <commit_sha> --yes
 
 # Options
 # - Custom evolution branch prefix
-openevolve-clean --repo /repo --all --prefix oe/it_ --yes
+uv run openevolve-clean --repo /repo --all --prefix oe/it_ --yes
 # - Remove .openevolve/worktrees (enabled by default; use --no-remove-worktrees to disable)
-openevolve-clean --repo /repo --all --no-remove-worktrees --yes
+uv run openevolve-clean --repo /repo --all --no-remove-worktrees --yes
 # - Remove the output directory
-openevolve-clean --repo /repo --all --remove-output --yes
+uv run openevolve-clean --repo /repo --all --remove-output --yes
 # - Tag the kept commit
-openevolve-clean --repo /repo --keep <sha> --tag openevolve/selected --yes
+uv run openevolve-clean --repo /repo --keep <sha> --tag openevolve/selected --yes
 # - Also delete matching branches on a remote (must explicitly provide remote)
-openevolve-clean --repo /repo --all --remote origin --yes
+uv run openevolve-clean --repo /repo --all --remote origin --yes
 ```
 
 Notes:

@@ -82,7 +82,7 @@ Guidelines:
 Run OpenEvolve using your repository and evaluator:
 
 ```bash
-python -m openevolve.cli /path/to/repo /path/to/evaluator.py \
+uv run -m openevolve.cli /path/to/repo /path/to/evaluator.py \
   --config configs/default_config.yaml \
   --root-commit <baseline_sha_or_branch> \
   --evolution-target "Improve correctness and performance while maintaining API." \
@@ -92,5 +92,5 @@ python -m openevolve.cli /path/to/repo /path/to/evaluator.py \
 Alternatively, use only the config file (set `database.root_commit` etc. inside YAML):
 
 ```bash
-python -m openevolve.cli /path/to/repo /path/to/evaluator.py --config my_config.yaml
+uv run -m openevolve.cli /path/to/repo /path/to/evaluator.py --config my_config.yaml
 ```

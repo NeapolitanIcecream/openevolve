@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, Optional
 
 # Note: This tool requires the `diff-match-patch` library.
-# Please ensure it is installed: pip install diff-match-patch
+# Prefer using uv to install: `uv add diff-match-patch` (or `pip install diff-match-patch`)
 import diff_match_patch as dmp_module
 
 from .base import BaseTool, FileDiff, Icon, ToolLocation, ToolResult, ToolResultDisplay
