@@ -127,7 +127,11 @@ llm:
   models:
     - name: "gpt-4o-mini"   # primary evolution model
       weight: 1.0
-  write_tool_model_name: "gpt-4o-mini"
+  # Model used when the agent performs multi-file writes
+  write_tool_model:
+    name: "gpt-4o-mini"
+  # Model used for session compression (optional)
+  compression_model: null
   tool_loop_max_steps: 30
 
 prompt:
@@ -138,7 +142,6 @@ prompt:
   session_max_tokens: 120000
   session_compress_threshold: 80000
   recent_history_tokens: 30000
-  compression_model_name: null
 
 database:
   git_repo_path: "/abs/path/to/repo"

@@ -124,11 +124,12 @@ class ToolRegistry:
     Manages the registration and discovery of tools.
     """
 
-    def __init__(self, config: Config, llm_client: Optional[LLMInterface] = None, evaluator: Optional[Any] = None):
+    def __init__(self, config: Config, llm_client: Optional[LLMInterface] = None, evaluator: Optional[Any] = None, write_llm_client: Optional[LLMInterface] = None):
         self.config = config
         self.tool_config = ToolConfig(root_dir=self.config.get("root_dir") or ".")
         self._tools: Dict[str, Tool] = {}
         self.llm_client = llm_client
+        self.write_llm_client = write_llm_client
         self._evaluator = evaluator
         self._register_builtin_tools()
 
@@ -139,7 +140,9 @@ class ToolRegistry:
             print("Warning: 'root_dir' not found in config. EditTool may not work correctly.")
             root_dir = "."
 
-        if self.llm_client:
+        if self.write_llm_client is not None:
+            self.register_tool(EditTool(root_dir=root_dir, llm_client=self.write_llm_client))
+        elif self.llm_client is not None:
             self.register_tool(EditTool(root_dir=root_dir, llm_client=self.llm_client))
         
         self.register_tool(ReadFileTool(config=self.tool_config))
@@ -155,6 +158,11 @@ class ToolRegistry:
     def set_llm_client(self, llm_client: LLMInterface):
         """Sets the LLM client and re-registers tools that require it."""
         self.llm_client = llm_client
+        self._register_builtin_tools()
+
+    def set_write_llm_client(self, llm_client: LLMInterface):
+        """Sets the dedicated write LLM client (for file editing) and re-registers relevant tools."""
+        self.write_llm_client = llm_client
         self._register_builtin_tools()
 
     def set_evaluator(self, evaluator: Any):

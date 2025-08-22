@@ -22,6 +22,7 @@ from openevolve.database import Program, ProgramDatabase
 from openevolve.evaluator import Evaluator
 from openevolve.llm.openai import OpenAILLM
 from openevolve.llm.session import ConversationSession
+from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.prompt.sampler import PromptSampler
 
 logger = logging.getLogger(__name__)
@@ -128,11 +129,20 @@ def _worker_init(config_dict: Dict[str, Any], evaluation_file: str) -> None:
     defaults_dict: Dict[str, Any] = cast(Dict[str, Any], llm_block.get('defaults', {}))
     defaults_cfg = LLMModelConfig(**defaults_dict) if isinstance(defaults_dict, dict) else LLMModelConfig()
 
+    # Dedicated models (optional)
+    write_tool_model_obj = None
+    compression_model_obj = None
+    if isinstance(llm_block.get('write_tool_model'), dict):
+        write_tool_model_obj = LLMModelConfig(**cast(Dict[str, Any], llm_block.get('write_tool_model')))
+    if isinstance(llm_block.get('compression_model'), dict):
+        compression_model_obj = LLMModelConfig(**cast(Dict[str, Any], llm_block.get('compression_model')))
+
     llm_config = LLMConfig(
         defaults=defaults_cfg,
         models=models,
         evaluator_models=evaluator_models,
-        write_tool_model_name=llm_block.get('write_tool_model_name'),
+        write_tool_model=write_tool_model_obj,
+        compression_model=compression_model_obj,
         tool_loop_max_steps=llm_block.get('tool_loop_max_steps', 30),
     )
     
@@ -178,7 +188,6 @@ def _lazy_init_worker_components():
     global _worker_session
     
     if _worker_llm_ensemble is None:
-        from openevolve.llm.ensemble import LLMEnsemble
         _worker_llm_ensemble = LLMEnsemble(_worker_config.llm.models)
 
     if _worker_prompt_sampler is None:
@@ -199,21 +208,26 @@ def _lazy_init_worker_components():
         _worker_registry = ToolRegistry(config={"root_dir": _worker_config.database.git_repo_path}, evaluator=_worker_evaluator)
 
     if _worker_llm is None:
-        # Choose the write-tool model; use the first model if not specified
-        model_cfg = None
-        desired = getattr(_worker_config.llm, "write_tool_model_name", None)
-        if desired:
-            for m in _worker_config.llm.models:
-                if m.name == desired:
-                    model_cfg = m
-                    break
-        if model_cfg is None:
-            model_cfg = _worker_config.llm.models[0]
-        _worker_llm = OpenAILLM(model_cfg, tool_registry=_worker_registry)
-        # Attach the unified session
-        _worker_llm.attach_session(_worker_session)
-        # Register the write-file tool
+        # Decide the main working client: single model -> OpenAILLM; multiple -> Ensemble
+        if len(_worker_config.llm.models) <= 1:
+            _worker_llm = OpenAILLM(_worker_config.llm.models[0], tool_registry=_worker_registry)
+        else:
+            _worker_llm = LLMEnsemble(_worker_config.llm.models, tool_registry=_worker_registry)
+        _worker_llm.attach_session(_worker_session)  # type: ignore[attr-defined]
         _worker_registry.set_llm_client(_worker_llm)
+
+        # Prepare dedicated write tool client if configured
+        write_cfg = None
+        if getattr(_worker_config.llm, "write_tool_model", None) is not None:
+            write_cfg = _worker_config.llm.write_tool_model
+        # Build write LLM client
+        if write_cfg is None:
+            # Fallback: use the main working client (ensemble or single)
+            write_llm_client = _worker_llm
+        else:
+            write_llm_client = OpenAILLM(write_cfg, tool_registry=_worker_registry)
+            write_llm_client.attach_session(_worker_session)
+        _worker_registry.set_write_llm_client(write_llm_client)
 
 
 def _run_iteration_worker(
@@ -266,12 +280,21 @@ def _run_iteration_worker(
             _worker_registry.config["root_dir"] = worktree_dir  # type: ignore[index]
 
         # Let the LLM layer run the full tool loop and maintain history
+        # Build compression client if configured
+        compression_client = None
+        comp_cfg = None
+        if getattr(_worker_config.llm, "compression_model", None) is not None:
+            comp_cfg = _worker_config.llm.compression_model
+        if comp_cfg is not None:
+            compression_client = OpenAILLM(comp_cfg, tool_registry=None)
+
         run_out: Dict[str, Any] = asyncio.run(
             _worker_llm.run_iteration_with_tools(
                 iteration=iteration,
                 parent_commit=parent_commit,
                 iteration_context=iteration_context,
                 prompt_cfg=_worker_config.prompt,
+                compression_client=compression_client,
                 max_steps=getattr(_worker_config.llm, 'tool_loop_max_steps', 30),
             )
         )
@@ -360,12 +383,22 @@ class ProcessParallelController:
     def _serialize_config(self, config: Config) -> Dict[str, Any]:
         """Serialize config object to a dictionary that can be pickled"""
         # Manual serialization to handle nested objects properly
+        def _maybe_asdict_model(m: Optional[LLMModelConfig]) -> Optional[Dict[str, Any]]:  # type: ignore[name-defined]
+            try:
+                from openevolve.config import LLMModelConfig as _LLMModelConfig  # type: ignore
+                if isinstance(m, _LLMModelConfig):
+                    return asdict(cast(Any, m))
+            except Exception:
+                pass
+            return None
+
         return {
             'llm': {
                 'defaults': asdict(config.llm.defaults),
                 'models': [asdict(m) for m in config.llm.models],
                 'evaluator_models': [asdict(m) for m in config.llm.evaluator_models],
-                'write_tool_model_name': getattr(config.llm, 'write_tool_model_name', None),
+                'write_tool_model': _maybe_asdict_model(getattr(config.llm, 'write_tool_model', None)),
+                'compression_model': _maybe_asdict_model(getattr(config.llm, 'compression_model', None)),
                 'tool_loop_max_steps': getattr(config.llm, 'tool_loop_max_steps', 30),
             },
             'prompt': asdict(config.prompt),

@@ -36,7 +36,10 @@ llm:
   evaluator_models: []
 
   # Model used when the agent performs multi-file write operations
-  write_tool_model_name: null
+  write_tool_model: null
+
+  # Optional model used for session compression
+  compression_model: null
 
   # Safety bound for tool loops
   tool_loop_max_steps: 30
@@ -67,7 +70,6 @@ prompt:
   session_max_tokens: 120000           # Hard cap per session
   session_compress_threshold: 80000    # Compress historical context beyond this
   recent_history_tokens: 30000         # Keep this many tokens uncompressed
-  compression_model_name: null         # Model used for compression (optional)
 
 # Database configuration
 database:

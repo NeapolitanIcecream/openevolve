@@ -20,7 +20,9 @@ llm:
       weight: 0.8
     - name: "gpt-4o"
       weight: 0.2
-  write_tool_model_name: "gpt-4o-mini"   # Model used for multi-file writes
+  write_tool_model:
+    name: "gpt-4o-mini"                  # Model used for multi-file writes
+  compression_model: null                 # Optional model used for session compression
   tool_loop_max_steps: 30
 
 # Prompt configuration (KV-cache friendly session)

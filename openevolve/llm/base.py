@@ -68,3 +68,17 @@ class LLMInterface(ABC):
     def detach_session(self) -> None:
         """Detach any previously attached conversation session."""
         raise NotImplementedError
+
+    @abstractmethod
+    async def run_iteration_with_tools(
+        self,
+        iteration: int,
+        parent_commit: str,
+        iteration_context: str,
+        *,
+        prompt_cfg: Any = None,
+        compression_client: Optional["LLMInterface"] = None,
+        max_steps: int = 30,
+    ) -> Dict[str, Any]:
+        """High-level tool loop for one iteration."""
+        raise NotImplementedError

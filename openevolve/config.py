@@ -3,7 +3,7 @@ Configuration handling for OpenEvolve
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -64,8 +64,9 @@ class LLMConfig:
     )
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
-    # Model used when the agent needs to perform write operations
-    write_tool_model_name: Optional[str] = None
+    # Optional dedicated models
+    write_tool_model: Optional[LLMModelConfig] = None
+    compression_model: Optional[LLMModelConfig] = None
 
     # Tool loop control
     tool_loop_max_steps: int = 30
@@ -110,6 +111,15 @@ class LLMConfig:
                     continue
                 if overwrite or getattr(model, key, None) is None:
                     setattr(model, key, value)
+        # Update dedicated models if present
+        for maybe_model in [self.write_tool_model, self.compression_model]:
+            if maybe_model is None:
+                continue
+            for key, value in args.items():
+                if value is None:
+                    continue
+                if overwrite or getattr(maybe_model, key, None) is None:
+                    setattr(maybe_model, key, value)
 
     def apply_env_defaults(self) -> None:
         """Apply environment variables (api_base, api_key) into defaults and models."""
@@ -150,7 +160,6 @@ class PromptConfig:
     session_max_tokens: int = 120000
     session_compress_threshold: int = 80000
     recent_history_tokens: int = 30000
-    compression_model_name: Optional[str] = None
 
 
 @dataclass
@@ -308,11 +317,21 @@ class Config:
             # Build model lists
             models = [LLMModelConfig(**m) for m in llm_dict.get("models", [])]
             evaluator_models = [LLMModelConfig(**m) for m in llm_dict.get("evaluator_models", [])]
+            write_tool_model_obj = None
+            compression_model_obj = None
+            wtm_raw = llm_dict.get("write_tool_model")
+            if isinstance(wtm_raw, dict):
+                write_tool_model_obj = LLMModelConfig(**wtm_raw)
+            cpm_raw = llm_dict.get("compression_model")
+            if isinstance(cpm_raw, dict):
+                compression_model_obj = LLMModelConfig(**cpm_raw)
+
             config.llm = LLMConfig(
                 defaults=defaults,
                 models=models or Config().llm.models,
                 evaluator_models=evaluator_models,
-                write_tool_model_name=llm_dict.get("write_tool_model_name"),
+                write_tool_model=write_tool_model_obj,
+                compression_model=compression_model_obj,
                 tool_loop_max_steps=llm_dict.get("tool_loop_max_steps", 30),
             )
         if "prompt" in config_dict:
@@ -353,7 +372,8 @@ class Config:
                 },
                 "models": self.llm.models,
                 "evaluator_models": self.llm.evaluator_models,
-                "write_tool_model_name": self.llm.write_tool_model_name,
+                "write_tool_model": asdict(self.llm.write_tool_model) if self.llm.write_tool_model else None,
+                "compression_model": asdict(self.llm.compression_model) if self.llm.compression_model else None,
                 "tool_loop_max_steps": self.llm.tool_loop_max_steps,
             },
             "prompt": {
@@ -367,7 +387,6 @@ class Config:
                 "session_max_tokens": self.prompt.session_max_tokens,
                 "session_compress_threshold": self.prompt.session_compress_threshold,
                 "recent_history_tokens": self.prompt.recent_history_tokens,
-                "compression_model_name": self.prompt.compression_model_name,
                 "include_artifacts": self.prompt.include_artifacts,
                 "max_artifact_bytes": self.prompt.max_artifact_bytes,
                 "artifact_security_filter": self.prompt.artifact_security_filter,

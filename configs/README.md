@@ -45,7 +45,6 @@ prompt:
   session_max_tokens: 120000
   session_compress_threshold: 80000
   recent_history_tokens: 30000
-  compression_model_name: null
 ```
 
 ## LLM Ensemble
@@ -60,7 +59,6 @@ llm:
       weight: 0.8
     - name: "gpt-4o"
       weight: 0.2
-  write_tool_model_name: null
 ```
 
 ## Island Model
@@ -86,7 +84,8 @@ uv run -m openevolve.cli /path/to/repo /path/to/evaluator.py \
   --config configs/default_config.yaml \
   --root-commit <baseline_sha_or_branch> \
   --evolution-target "Improve correctness and performance while maintaining API." \
-  --write-tool-model gpt-4o-mini
+  --write-tool-model gpt-4o-mini \
+  --compression-model gpt-4o-mini
 ```
 
 Alternatively, use only the config file (set `database.root_commit` etc. inside YAML):

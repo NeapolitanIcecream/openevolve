@@ -142,8 +142,17 @@ async def main_async() -> int:
             print(f"Using secondary model: {args.secondary_model}")
 
         if args.write_tool_model:
-            config.llm.write_tool_model_name = args.write_tool_model
-            print(f"Using write-tool model: {config.llm.write_tool_model_name}")
+            # Map name to a model config object if it matches one of the ensemble models
+            from openevolve.config import LLMModelConfig
+            chosen = None
+            for m in config.llm.models:
+                if m.name == args.write_tool_model:
+                    chosen = m
+                    break
+            if chosen is None:
+                chosen = LLMModelConfig(name=args.write_tool_model, weight=1.0)
+            config.llm.write_tool_model = chosen
+            print(f"Using write-tool model (object): {args.write_tool_model}")
 
         # ---- Database / commit evolution overrides ----
         if args.root_commit:
@@ -174,8 +183,17 @@ async def main_async() -> int:
             print(f"Recent history tokens: {config.prompt.recent_history_tokens}")
 
         if args.compression_model is not None:
-            config.prompt.compression_model_name = args.compression_model
-            print(f"Compression model: {config.prompt.compression_model_name}")
+            # Prefer dedicated compression model object under llm
+            from openevolve.config import LLMModelConfig
+            chosen = None
+            for m in config.llm.models:
+                if m.name == args.compression_model:
+                    chosen = m
+                    break
+            if chosen is None:
+                chosen = LLMModelConfig(name=args.compression_model, weight=1.0)
+            config.llm.compression_model = chosen
+            print(f"Compression model (object): {args.compression_model}")
 
     # Initialize OpenEvolve
     try:

@@ -359,6 +359,7 @@ class OpenAILLM(LLMInterface):
         iteration_context: str,
         *,
         prompt_cfg: Any = None,
+        compression_client: Optional[LLMInterface] = None,
         max_steps: int = 30,
     ) -> Dict[str, Any]:
         if not self._session:
@@ -461,7 +462,7 @@ class OpenAILLM(LLMInterface):
         # Optional compression after iteration completes
         try:
             if hasattr(self._session, "compress_if_needed"):
-                await self._session.compress_if_needed(prompt_cfg, self)
+                await self._session.compress_if_needed(prompt_cfg, compression_client or self)
         except Exception as e:
             logger.debug(f"Session compression skipped or failed: {e}")
 

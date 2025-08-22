@@ -66,6 +66,9 @@ class LLMEnsemble(LLMInterface):
             "calls": 0,
         }
 
+        # Registry reference for tool loop
+        self.tool_registry = tool_registry
+
     def _sample_model(self) -> LLMInterface:
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]
         sampled_model = self.models[index]
@@ -128,6 +131,49 @@ class LLMEnsemble(LLMInterface):
         except Exception:
             pass
         return result
+
+    async def run_iteration_with_tools(
+        self,
+        iteration: int,
+        parent_commit: str,
+        iteration_context: str,
+        *,
+        prompt_cfg: Any = None,
+        compression_client: Optional[LLMInterface] = None,
+        max_steps: int = 30,
+    ) -> Dict[str, Any]:
+        if not self._session:
+            raise RuntimeError("No session attached to LLM client")
+        if not self.tool_registry:
+            raise RuntimeError("No ToolRegistry attached to LLM client")
+
+        # Start iteration context as a user message on shared session
+        self._session.start_iteration(iteration, parent_commit, iteration_context)
+
+        # Delegate the loop to a sampled model but keep shared session
+        model = self._sample_model()
+        # Ensure the sampled model uses same tool registry and session
+        try:
+            if hasattr(model, "tool_registry") and getattr(model, "tool_registry") is None:
+                setattr(model, "tool_registry", self.tool_registry)
+        except Exception:
+            pass
+        try:
+            model.attach_session(self._session)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # Use a cast to satisfy static type checker as the interface provides this method
+        from typing import cast, Any
+        run_with_tools = cast(Any, model).run_iteration_with_tools
+        return await run_with_tools(
+            iteration,
+            parent_commit,
+            iteration_context,
+            prompt_cfg=prompt_cfg,
+            compression_client=compression_client,
+            max_steps=max_steps,
+        )
 
     async def get_history(self) -> List[Dict[str, Any]]:
         return self._session.get_history() if self._session else []

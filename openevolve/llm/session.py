@@ -121,7 +121,6 @@ class ConversationSession:
 
         tail = self.messages[keep_start_index:]
         self.messages.clear()
-        self.messages.append({"role": "system", "content": self.system_message, "created": _now_ms()})
         self.messages.append({"role": "user", "content": summary_text, "created": _now_ms()})
         self.messages.append({"role": "assistant", "content": "Got it. Thanks for the additional context.", "created": _now_ms()})
         self.messages.extend(tail)
