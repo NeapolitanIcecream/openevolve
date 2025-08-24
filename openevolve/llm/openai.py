@@ -5,12 +5,20 @@ OpenAI API interface for LLMs
 import asyncio
 import logging
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast, TypeVar
 
 import openai
 
-from openevolve.config import LLMModelConfig
-from openevolve.llm.base import LLMInterface, LLMResult, ToolCall
+from openevolve.config import LLMModelConfig, PromptConfig
+from openevolve.llm.base import (
+    LLMInterface,
+    LLMResult,
+    ToolCall,
+    ChatMessage,
+    ToolSpec,
+    TokenUsage,
+    IterationRunResult,
+)
 from openevolve.llm.session import ConversationSession
 from openevolve.tools.registry import ToolRegistry
 
@@ -67,10 +75,10 @@ class OpenAILLM(LLMInterface):
     async def invoke(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        messages: List[ChatMessage],
         system_message: Optional[str] = None,
-        response_format: Optional[Dict[str, Any]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, object]] = None,
+        tools: Optional[List[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -234,21 +242,22 @@ class OpenAILLM(LLMInterface):
             out["messages"] = msgs[:1] + ["...", msgs[-1]]
         return out
 
-    def _fallback(self, v: Optional[Any], default: Optional[Any]) -> Optional[Any]:
+    T = TypeVar("T")
+
+    def _fallback(self, v: Optional[T], default: Optional[T]) -> Optional[T]:
         return v if v is not None else default
 
-    def _extract_usage(self, response: Any) -> Dict[str, Any]:
+    def _extract_usage(self, response: Any) -> TokenUsage:
         """Extract usage info from OpenAI response robustly.
 
         Returns keys: prompt_tokens, completion_tokens, total_tokens, cached_tokens
         """
-        usage: Dict[str, Any] = {}
         try:
-            raw_usage = getattr(response, "usage", None)
+            raw_usage: Any = getattr(response, "usage", None)
             if raw_usage is None and hasattr(response, "to_dict"):
                 # Fallback for some client variants
                 try:
-                    raw_dict = response.to_dict()
+                    raw_dict: Any = response.to_dict()
                     raw_usage = raw_dict.get("usage") if isinstance(raw_dict, dict) else None
                 except Exception:
                     raw_usage = None
@@ -271,23 +280,26 @@ class OpenAILLM(LLMInterface):
             total_tokens = int(_get(raw_usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
 
             # cached_tokens often lives in prompt_tokens_details.cached_tokens
-            prompt_tokens_details = _get(raw_usage, "prompt_tokens_details", None)
+            prompt_tokens_details: Any = _get(raw_usage, "prompt_tokens_details", None)
             cached_tokens = int(_get(prompt_tokens_details, "cached_tokens", 0) or 0)
-
-            usage.update(
-                {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "cached_tokens": cached_tokens,
-                }
-            )
         except Exception:
             # Provide at least zeroed structure to avoid KeyErrors upstream
-            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0}
-        return usage
+            prompt_tokens = 0
+            completion_tokens = 0
+            total_tokens = 0
+            cached_tokens = 0
 
-    def _accumulate_usage(self, usage: Dict[str, Any]) -> None:
+        return cast(
+            TokenUsage,
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "cached_tokens": cached_tokens,
+            },
+        )
+
+    def _accumulate_usage(self, usage: TokenUsage) -> None:
         try:
             self._usage_cumulative["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
             self._usage_cumulative["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
@@ -320,11 +332,11 @@ class OpenAILLM(LLMInterface):
     def detach_session(self) -> None:
         self._session = None
 
-    async def get_history(self) -> List[Dict[str, Any]]:
+    async def get_history(self) -> List[ChatMessage]:
         return self._session.get_history() if self._session else []
 
     # --- Helpers ---
-    def _sanitize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_messages(self, messages: List[ChatMessage]) -> List[Dict[str, Any]]:
         """Filter message fields to those accepted by OpenAI Chat Completions."""
         allowed_top = {"role", "content", "name", "tool_call_id", "tool_calls"}
         allowed_fn = {"name", "arguments"}
@@ -334,8 +346,8 @@ class OpenAILLM(LLMInterface):
             out: Dict[str, Any] = {k: v for k, v in m.items() if k in allowed_top}
             # Normalize assistant.tool_calls
             if role == "assistant" and isinstance(m.get("tool_calls"), list):
-                tcs = []
-                for tc in m["tool_calls"]:
+                tcs: List[Dict[str, Any]] = []
+                for tc in m.get("tool_calls", []):
                     try:
                         fn = tc.get("function") or {}
                         tcs.append(
@@ -358,10 +370,10 @@ class OpenAILLM(LLMInterface):
         parent_commit: str,
         iteration_context: str,
         *,
-        prompt_cfg: Any = None,
+        prompt_cfg: Optional[PromptConfig] = None,
         compression_client: Optional[LLMInterface] = None,
         max_steps: int = 30,
-    ) -> Dict[str, Any]:
+    ) -> IterationRunResult:
         if not self._session:
             raise RuntimeError("No session attached to LLM client")
         if not self.tool_registry:
@@ -370,12 +382,12 @@ class OpenAILLM(LLMInterface):
         # Start iteration context as a user message
         self._session.start_iteration(iteration, parent_commit, iteration_context)
 
-        metrics: Dict[str, Any] = {}
+        metrics: Dict[str, object] = {}
         did_evaluate = False
         commit_message: Optional[str] = None
 
         for _ in range(max_steps):
-            tools = self.tool_registry.get_tool_specs()
+            tools = cast(List[ToolSpec], self.tool_registry.get_tool_specs())
             out = await self.invoke(
                 messages=self._session.messages,
                 system_message=self._session.system_message,

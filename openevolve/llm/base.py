@@ -4,7 +4,58 @@ Base LLM interface
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING, Literal, TypedDict
+
+if TYPE_CHECKING:
+    # Imported only for type checking to avoid runtime cycles
+    from openevolve.llm.session import ConversationSession
+    from openevolve.config import PromptConfig
+
+
+# --- Shared OpenAI-style chat and tool types ---
+
+class FunctionCall(TypedDict):
+    name: str
+    arguments: str
+
+
+class AssistantToolCall(TypedDict):
+    id: str
+    type: Literal["function"]
+    function: FunctionCall
+
+
+class ChatMessage(TypedDict, total=False):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str]
+    name: str
+    tool_call_id: str
+    tool_calls: List[AssistantToolCall]
+    created: int
+
+
+class ToolFunctionDef(TypedDict, total=False):
+    name: str
+    description: Optional[str]
+    parameters: Dict[str, object]
+
+
+class ToolSpec(TypedDict):
+    type: Literal["function"]
+    function: ToolFunctionDef
+
+
+class TokenUsage(TypedDict, total=False):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cached_tokens: int
+
+
+class IterationRunResult(TypedDict, total=False):
+    metrics: Dict[str, object]
+    did_evaluate: bool
+    commit_message: Optional[str]
 
 
 @dataclass
@@ -18,10 +69,10 @@ class ToolCall:
 class LLMResult:
     content: Optional[str] = None
     tool_calls: List[ToolCall] = field(default_factory=list)
-    json: Optional[Any] = None
-    raw: Optional[Any] = None
+    json: Optional[object] = None
+    raw: Optional[object] = None
     # Optional usage stats for token accounting
-    usage: Optional[Dict[str, Any]] = None
+    usage: Optional[TokenUsage] = None
 
 
 class LLMInterface(ABC):
@@ -31,10 +82,10 @@ class LLMInterface(ABC):
     async def invoke(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        messages: List[ChatMessage],
         system_message: Optional[str] = None,
-        response_format: Optional[Dict[str, Any]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, object]] = None,
+        tools: Optional[List[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -55,12 +106,12 @@ class LLMInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_history(self) -> List[Dict[str, Any]]:
+    async def get_history(self) -> List[ChatMessage]:
         """Get the conversation history (OpenAI Chat format messages)."""
         raise NotImplementedError
 
     @abstractmethod
-    def attach_session(self, session: Any) -> None:
+    def attach_session(self, session: "ConversationSession") -> None:
         """Attach a conversation session to this client for history access."""
         raise NotImplementedError
 
@@ -76,9 +127,9 @@ class LLMInterface(ABC):
         parent_commit: str,
         iteration_context: str,
         *,
-        prompt_cfg: Any = None,
+        prompt_cfg: Optional["PromptConfig"] = None,
         compression_client: Optional["LLMInterface"] = None,
         max_steps: int = 30,
-    ) -> Dict[str, Any]:
+    ) -> IterationRunResult:
         """High-level tool loop for one iteration."""
         raise NotImplementedError

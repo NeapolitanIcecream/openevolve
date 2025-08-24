@@ -4,9 +4,9 @@ Model ensemble for LLMs
 
 import logging
 import random
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, cast
 
-from openevolve.llm.base import LLMInterface, LLMResult
+from openevolve.llm.base import LLMInterface, LLMResult, ChatMessage, ToolSpec, IterationRunResult
 from openevolve.llm.session import ConversationSession
 from openevolve.llm.openai import OpenAILLM
 from openevolve.config import LLMModelConfig
@@ -81,10 +81,10 @@ class LLMEnsemble(LLMInterface):
     async def invoke(
         self,
         *,
-        messages: List[Dict[str, Any]],
+        messages: List[ChatMessage],
         system_message: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
+        tools: Optional[List[ToolSpec]] = None,
         tool_choice: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -141,7 +141,7 @@ class LLMEnsemble(LLMInterface):
         prompt_cfg: Any = None,
         compression_client: Optional[LLMInterface] = None,
         max_steps: int = 30,
-    ) -> Dict[str, Any]:
+    ) -> IterationRunResult:
         if not self._session:
             raise RuntimeError("No session attached to LLM client")
         if not self.tool_registry:
@@ -159,13 +159,12 @@ class LLMEnsemble(LLMInterface):
         except Exception:
             pass
         try:
-            model.attach_session(self._session)  # type: ignore[attr-defined]
+            model.attach_session(self._session)
         except Exception:
             pass
 
         # Use a cast to satisfy static type checker as the interface provides this method
-        from typing import cast, Any
-        run_with_tools = cast(Any, model).run_iteration_with_tools
+        run_with_tools = cast(LLMInterface, model).run_iteration_with_tools
         return await run_with_tools(
             iteration,
             parent_commit,
@@ -175,21 +174,21 @@ class LLMEnsemble(LLMInterface):
             max_steps=max_steps,
         )
 
-    async def get_history(self) -> List[Dict[str, Any]]:
+    async def get_history(self) -> List[ChatMessage]:
         return self._session.get_history() if self._session else []
 
     def attach_session(self, session: ConversationSession) -> None:
         self._session = session
         for m in self.models:
             try:
-                m.attach_session(session)  # type: ignore[attr-defined]
+                m.attach_session(session)
             except Exception:
                 pass
 
     def detach_session(self) -> None:
         for m in self.models:
             try:
-                m.detach_session()  # type: ignore[attr-defined]
+                m.detach_session()
             except Exception:
                 pass
         self._session = None

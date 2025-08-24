@@ -23,6 +23,7 @@ from openevolve.evaluator import Evaluator
 from openevolve.llm.openai import OpenAILLM
 from openevolve.llm.session import ConversationSession
 from openevolve.llm.ensemble import LLMEnsemble
+from openevolve.llm.base import IterationRunResult
 from openevolve.prompt.sampler import PromptSampler
 
 logger = logging.getLogger(__name__)
@@ -288,7 +289,7 @@ def _run_iteration_worker(
         if comp_cfg is not None:
             compression_client = OpenAILLM(comp_cfg, tool_registry=None)
 
-        run_out: Dict[str, Any] = asyncio.run(
+        run_out: IterationRunResult = asyncio.run(
             _worker_llm.run_iteration_with_tools(
                 iteration=iteration,
                 parent_commit=parent_commit,

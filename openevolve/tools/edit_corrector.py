@@ -7,9 +7,9 @@ import json
 import os
 import re
 from collections import OrderedDict
-from typing import Any, Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional, cast
 
-from openevolve.llm.base import LLMInterface
+from openevolve.llm.base import LLMInterface, ChatMessage
 # --- Caching --- #
 
 class LruCache:
@@ -117,14 +117,14 @@ async def find_last_edit_timestamp(file_path: str, client: LLMInterface) -> int:
     We prefer timestamps on entries via keys like "created"/"timestamp" (seconds or ms).
     If absent, we cannot recover time and will return -1.
     """
-    history = await client.get_history() or []
+    history: list[ChatMessage] = await client.get_history() or []
 
     # Define tool names of interest. We prioritize write operations.
     tools_in_response = {"edit"}
     tools_in_call = {"edit", "read_file", "read_many_files"}
 
-    def _extract_ts(entry: Dict[str, Any]) -> Optional[int]:
-        ts = entry.get("created") or entry.get("timestamp") or entry.get("created_at")
+    def _extract_ts(entry: ChatMessage) -> Optional[int]:
+        ts = cast(Any, entry.get("created") or entry.get("timestamp") or entry.get("created_at"))
         if isinstance(ts, (int, float)):
             ts_int = int(ts)
             # Normalize to milliseconds
@@ -136,8 +136,9 @@ async def find_last_edit_timestamp(file_path: str, client: LLMInterface) -> int:
     # Scan newest to oldest
     for entry in reversed(history):
         role = entry.get("role")
-        if role == "assistant" and isinstance(entry.get("tool_calls"), list):
-            for tc in entry["tool_calls"]:
+        tool_calls = entry.get("tool_calls")
+        if role == "assistant" and isinstance(tool_calls, list):
+            for tc in tool_calls:
                 try:
                     f_id = tc.get("id")
                     fn = (tc.get("function") or {})
@@ -155,7 +156,7 @@ async def find_last_edit_timestamp(file_path: str, client: LLMInterface) -> int:
                         last_ts = max(last_ts, ts)
 
         elif role == "tool":
-            name = (entry.get("name") or "").strip()
+            name = (cast(Any, entry.get("name")) or "").strip()
             if name not in tools_in_response:
                 continue
             content = entry.get("content")
@@ -237,9 +238,11 @@ Return ONLY the corrected target snippet in the specified JSON format with the k
                 "json_schema": {"name": "response", "schema": OLD_STRING_CORRECTION_SCHEMA},
             },
         )
-        result = out.json or {}
-        if isinstance(result.get('corrected_target_snippet'), str) and result['corrected_target_snippet']:
-            return result['corrected_target_snippet']
+        result_obj: Any = out.json or {}
+        if isinstance(result_obj, dict):
+            maybe = result_obj.get('corrected_target_snippet')
+            if isinstance(maybe, str) and maybe:
+                return maybe
     except Exception as e:
         if abort_signal.is_set(): raise
         print(f"Error during LLM call for old_string correction: {e}")
@@ -276,9 +279,11 @@ Return ONLY the corrected `new_string` in the specified JSON format with the key
                 "json_schema": {"name": "response", "schema": NEW_STRING_CORRECTION_SCHEMA},
             },
         )
-        result = out.json or {}
-        if isinstance(result.get('corrected_new_string'), str) and result['corrected_new_string']:
-            return result['corrected_new_string']
+        result_obj: Any = out.json or {}
+        if isinstance(result_obj, dict):
+            maybe = result_obj.get('corrected_new_string')
+            if isinstance(maybe, str) and maybe:
+                return maybe
     except Exception as e:
         if abort_signal.is_set(): raise
         print(f"Error during LLM call for new_string correction: {e}")
@@ -311,9 +316,11 @@ Return ONLY the corrected string in the specified JSON format with the key 'corr
                 "json_schema": {"name": "response", "schema": CORRECT_NEW_STRING_ESCAPING_SCHEMA},
             },
         )
-        result = out.json or {}
-        if isinstance(result.get('corrected_new_string_escaping'), str) and result['corrected_new_string_escaping']:
-            return result['corrected_new_string_escaping']
+        result_obj: Any = out.json or {}
+        if isinstance(result_obj, dict):
+            maybe = result_obj.get('corrected_new_string_escaping')
+            if isinstance(maybe, str) and maybe:
+                return maybe
     except Exception as e:
         if abort_signal.is_set(): raise
         print(f"Error during LLM call for new_string escaping correction: {e}")
@@ -341,9 +348,11 @@ Return ONLY the corrected string in the specified JSON format with the key 'corr
                 "json_schema": {"name": "response", "schema": CORRECT_STRING_ESCAPING_SCHEMA},
             },
         )
-        result = out.json or {}
-        if isinstance(result.get('corrected_string_escaping'), str) and result['corrected_string_escaping']:
-            return result['corrected_string_escaping']
+        result_obj: Any = out.json or {}
+        if isinstance(result_obj, dict):
+            maybe = result_obj.get('corrected_string_escaping')
+            if isinstance(maybe, str) and maybe:
+                return maybe
     except Exception as e:
         if abort_signal.is_set(): raise
         print(f"Error during LLM call for string escaping correction: {e}")

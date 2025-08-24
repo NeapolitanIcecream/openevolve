@@ -6,7 +6,14 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
+
+from openevolve.llm.base import (
+    AssistantToolCall,
+    ChatMessage,
+    LLMInterface,
+)
+from openevolve.config import PromptConfig
 
 
 def _now_ms() -> int:
@@ -22,7 +29,7 @@ class ConversationSession:
 
     def __init__(self, system_message: str) -> None:
         self.system_message: str = system_message
-        self.messages: List[Dict[str, Any]] = []
+        self.messages: List[ChatMessage] = []
         self.iteration_boundaries: List[int] = []
 
     def start_iteration(self, iteration: int, parent_commit: str, iteration_context: str) -> None:
@@ -34,7 +41,7 @@ class ConversationSession:
             }
         )
 
-    def record_assistant_tool_calls(self, assistant_tool_calls: List[Dict[str, Any]]) -> None:
+    def record_assistant_tool_calls(self, assistant_tool_calls: List[AssistantToolCall]) -> None:
         self.messages.append(
             {
                 "role": "assistant",
@@ -61,18 +68,18 @@ class ConversationSession:
     def mark_evaluated(self) -> None:
         self.iteration_boundaries.append(len(self.messages))
 
-    def to_openai_messages(self) -> List[Dict[str, Any]]:
+    def to_openai_messages(self) -> List[ChatMessage]:
         return list(self.messages)
 
-    def get_history(self) -> List[Dict[str, Any]]:
+    def get_history(self) -> List[ChatMessage]:
         return list(self.messages)
 
-    async def compress_if_needed(self, prompt_cfg: Any, llm_client: Any) -> None:
+    async def compress_if_needed(self, prompt_cfg: Optional[PromptConfig], llm_client: LLMInterface) -> None:
         max_tokens = getattr(prompt_cfg, "session_max_tokens", 120000)
         compress_threshold = getattr(prompt_cfg, "session_compress_threshold", 80000)
         recent_limit = getattr(prompt_cfg, "recent_history_tokens", 30000)
 
-        def _estimate_chars(msgs: List[Dict[str, Any]]) -> int:
+        def _estimate_chars(msgs: List[ChatMessage]) -> int:
             try:
                 return sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs)
             except Exception:
@@ -98,7 +105,7 @@ class ConversationSession:
 
         head = self.messages[:keep_start_index]
 
-        summary_messages: List[Dict[str, Any]] = []
+        summary_messages: List[ChatMessage] = []
         summary_messages.append(
             {
                 "role": "user",
