@@ -7,12 +7,9 @@ import json
 import logging
 import os
 import random
-import subprocess
 import time
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
-
-import numpy as np
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast, Mapping, TypedDict
 
 from openevolve.config import DatabaseConfig
 from openevolve.utils.metrics_utils import safe_numeric_average
@@ -22,7 +19,28 @@ from openevolve.utils.git_utils import diff_between
 logger = logging.getLogger(__name__)
 
 
-def _safe_sum_metrics(metrics: Dict[str, Any]) -> float:
+# -------- Typed helpers --------
+Numeric = Union[int, float]
+
+
+class PromptEntry(TypedDict, total=False):
+    system: str
+    user: str
+    responses: List[str]
+
+
+class DiversityCacheEntry(TypedDict):
+    value: float
+    timestamp: float
+
+
+class FeatureStats(TypedDict):
+    min: float
+    max: float
+    values: List[float]
+
+
+def _safe_sum_metrics(metrics: Mapping[str, Numeric]) -> float:
     """Safely sum only numeric metric values, ignoring strings and other types"""
     numeric_values = [
         v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -30,7 +48,7 @@ def _safe_sum_metrics(metrics: Dict[str, Any]) -> float:
     return sum(numeric_values) if numeric_values else 0.0
 
 
-def _safe_avg_metrics(metrics: Dict[str, Any]) -> float:
+def _safe_avg_metrics(metrics: Mapping[str, Numeric]) -> float:
     """Safely calculate average of only numeric metric values"""
     numeric_values = [
         v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -66,7 +84,7 @@ class Program:
     diversity: float = 0.0
 
     # Metadata
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, object] = field(default_factory=dict)
 
     # Artifact storage
     artifacts_json: Optional[str] = None  # JSON-serialized small artifacts
@@ -148,7 +166,7 @@ class ProgramDatabase:
             self.load(config.db_path)
 
         # Prompt log
-        self.prompts_by_program: Dict[str, Dict[str, Dict[str, Union[str, List[str]]]]] = {}
+        self.prompts_by_program: Dict[str, Dict[str, PromptEntry]] = {}
 
         # Set random seed for reproducible sampling if specified
         if config.random_seed is not None:
@@ -158,15 +176,13 @@ class ProgramDatabase:
             logger.debug(f"Database: Set random seed to {config.random_seed}")
 
         # Diversity caching infrastructure
-        self.diversity_cache: Dict[int, Dict[str, Union[float, float]]] = (
-            {}
-        )  # hash -> {"value": float, "timestamp": float}
+        self.diversity_cache: Dict[int, DiversityCacheEntry] = {}
         self.diversity_cache_size: int = getattr(config, "diversity_cache_size", 1000)
         self.diversity_reference_set: List[List[int]] = []  # Reference signatures
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
-        self.feature_stats: Dict[str, Dict[str, Union[float, float, List[float]]]] = {}
+        self.feature_stats: Dict[str, FeatureStats] = {}
         self.feature_scaling_method: str = getattr(config, "feature_scaling_method", "minmax")
 
         # Per-dimension bins support
@@ -675,7 +691,7 @@ class ProgramDatabase:
         self,
         program: Program,
         base_path: Optional[str] = None,
-        prompts: Optional[Dict[str, Dict[str, Union[str, List[str]]]]] = None,
+        prompts: Optional[Dict[str, PromptEntry]] = None,
     ) -> None:
         """
         Save a program to disk
@@ -1102,7 +1118,7 @@ class ProgramDatabase:
         archive_programs_in_island = [
             pid
             for pid in valid_archive
-            if self.programs[pid].metadata.get("island") == self.current_island
+            if cast(Optional[int], self.programs[pid].metadata.get("island")) == self.current_island
         ]
 
         if archive_programs_in_island:
@@ -1141,7 +1157,7 @@ class ProgramDatabase:
         inspirations = []
 
         # Get the parent's island (should be current_island)
-        parent_island = parent.metadata.get("island", self.current_island)
+        parent_island = cast(int, parent.metadata.get("island", self.current_island))
 
         # Get all programs from the current island
         island_program_ids = list(self.islands[parent_island])
@@ -1450,7 +1466,7 @@ class ProgramDatabase:
 
                 # Check metadata consistency
                 program = self.programs[program_id]
-                stored_island = program.metadata.get("island")
+                stored_island = cast(Optional[int], program.metadata.get("island"))
                 if stored_island != i:
                     logger.warning(
                         f"Island mismatch for program {program_id}: "
@@ -1740,7 +1756,7 @@ class ProgramDatabase:
         stats["max"] = max(stats["max"], value)
 
         # Keep recent values for more sophisticated scaling methods
-        values_list: List[float] = cast(List[float], stats["values"])
+        values_list = stats["values"]
         values_list.append(value)
         stats["values"] = values_list
         if len(stats["values"]) > 1000:  # Limit memory usage
@@ -1765,8 +1781,8 @@ class ProgramDatabase:
 
         if self.feature_scaling_method == "minmax":
             # Min-max normalization to [0, 1]
-            min_val = cast(float, stats["min"])
-            max_val = cast(float, stats["max"])
+            min_val = stats["min"]
+            max_val = stats["max"]
 
             if max_val == min_val:
                 return 0.5  # All values are the same
@@ -1776,7 +1792,7 @@ class ProgramDatabase:
 
         elif self.feature_scaling_method == "percentile":
             # Use percentile ranking
-            values = cast(List[float], stats["values"])
+            values = stats["values"]
             if not values:
                 return 0.5
 
@@ -1795,8 +1811,8 @@ class ProgramDatabase:
             return min(1.0, max(0.0, value))
 
         stats = self.feature_stats[feature_name]
-        min_val = cast(float, stats["min"])
-        max_val = cast(float, stats["max"])
+        min_val = stats["min"]
+        max_val = stats["max"]
 
         if max_val == min_val:
             return 0.5
@@ -1912,13 +1928,13 @@ class ProgramDatabase:
         else:
             return len(str(value).encode("utf-8"))
 
-    def _artifact_serializer(self, obj):
+    def _artifact_serializer(self, obj: object) -> object:
         """JSON serializer for artifacts that handles bytes"""
         if isinstance(obj, bytes):
             return {"__bytes__": base64.b64encode(obj).decode("utf-8")}
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    def _artifact_deserializer(self, dct):
+    def _artifact_deserializer(self, dct: Dict[str, str]) -> Union[bytes, Dict[str, str]]:
         """JSON deserializer for artifacts that handles bytes"""
         if "__bytes__" in dct:
             return base64.b64decode(dct["__bytes__"])
@@ -1990,7 +2006,7 @@ class ProgramDatabase:
         self,
         program_id: str,
         template_key: str,
-        prompt: Dict[str, Union[str, List[str]]],
+        prompt: PromptEntry,
         responses: Optional[List[str]] = None,
     ) -> None:
         """
@@ -2009,7 +2025,7 @@ class ProgramDatabase:
 
         if responses is None:
             responses = []
-        prompt["responses"] = responses  # type: ignore[index]
+        prompt["responses"] = responses
 
         if self.prompts_by_program is None:
             self.prompts_by_program = {}
