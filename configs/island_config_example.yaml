@@ -28,8 +28,6 @@ llm:
 # Prompt configuration (KV-cache friendly session)
 prompt:
   system_message: "You are an expert coder evolving a repository through safe, incremental commits."
-  num_top_programs: 3
-  num_diverse_programs: 2
   use_template_stochasticity: true
   
   session_max_tokens: 120000

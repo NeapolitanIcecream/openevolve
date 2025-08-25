@@ -3,7 +3,7 @@ Configuration handling for OpenEvolve
 """
 
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -134,19 +134,19 @@ class LLMConfig:
 class PromptConfig:
     """Configuration for prompt generation"""
 
+    # TODO: Support external prompt templates loaded from directory
     template_dir: Optional[str] = None
     system_message: str = "system_message"
+    # TODO: System prompt for LLM-as-Evaluator / feedback (not yet wired)
     evaluator_system_message: str = "evaluator_system_message"
 
-    # Number of examples to include in the prompt
-    num_top_programs: int = 3
-    num_diverse_programs: int = 2
-
     # Template stochasticity
+    # TODO: Template randomization not implemented yet
     use_template_stochasticity: bool = True
     template_variations: Dict[str, List[str]] = field(default_factory=dict)
 
     # Meta-prompting
+    # TODO: Meta prompting is not implemented; kept for future experiments
     use_meta_prompting: bool = False
     meta_prompt_weight: float = 0.1
 
@@ -366,8 +366,6 @@ class Config:
                 "template_dir": self.prompt.template_dir,
                 "system_message": self.prompt.system_message,
                 "evaluator_system_message": self.prompt.evaluator_system_message,
-                "num_top_programs": self.prompt.num_top_programs,
-                "num_diverse_programs": self.prompt.num_diverse_programs,
                 "use_template_stochasticity": self.prompt.use_template_stochasticity,
                 "template_variations": self.prompt.template_variations,
                 "session_max_tokens": self.prompt.session_max_tokens,
