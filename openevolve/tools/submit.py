@@ -35,7 +35,7 @@ class SubmitTool(BaseTool):
                 "properties": {
                     "program_id": {
                         "type": "string",
-                        "description": "Optional ID for logging and artifact tracking.",
+                        "description": "Optional ID for logging.",
                     },
                     "commit_message": {
                         "type": "string",

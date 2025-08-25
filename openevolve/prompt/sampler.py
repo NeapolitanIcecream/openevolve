@@ -3,7 +3,7 @@ Prompt sampler for commit-based evolution (simplified, code-agnostic)
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from openevolve.config import PromptConfig
 
@@ -48,13 +48,11 @@ class PromptSampler:
         parent_prompt_diff: Optional[str],
         inspiration_diffs: List[str],
         parent_metrics: Dict[str, Any],
-        artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
         max_inspirations: int = 2,
     ) -> str:
         """Construct per-iteration context text (appended to session history).
 
-        Includes only necessary increments: target, diffs for parent and inspirations, parent metrics,
-        and optional summary of last execution artifacts.
+        Includes only necessary increments: target, diffs for parent and inspirations, and parent metrics.
         """
         parts: List[str] = []
         if evolution_target:
@@ -73,11 +71,6 @@ class PromptSampler:
                     continue
                 parts.append("Inspiration (root→commit):\n" + diff)
 
-        if self.config.include_artifacts and artifacts:
-            rendered = self._render_artifacts(artifacts)
-            if rendered:
-                parts.append(rendered)
-
         return "\n\n".join(parts).strip()
 
     def _format_metrics(self, metrics: Dict[str, Any]) -> str:
@@ -92,25 +85,6 @@ class PromptSampler:
                 lines.append(f"- {k}: {v}")
         return "\n".join(lines)
 
-    def _render_artifacts(self, artifacts: Dict[str, Union[str, bytes]]) -> str:
-        if not artifacts:
-            return ""
-        sections: List[str] = []
-        for key, value in artifacts.items():
-            content = self._safe_decode_artifact(value)
-            sections.append(f"### {key}\n```\n{content}\n```")
-        if sections:
-            return "## Last Execution Output\n\n" + "\n\n".join(sections)
-        return ""
-
-    def _safe_decode_artifact(self, value: Union[str, bytes]) -> str:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, bytes):
-            try:
-                return value.decode("utf-8", errors="replace")
-            except Exception:
-                return f"<binary data: {len(value)} bytes>"
-        return str(value)
+    
 
     

@@ -31,8 +31,7 @@ prompt:
   num_top_programs: 3
   num_diverse_programs: 2
   use_template_stochasticity: true
-  include_artifacts: true
-  max_artifact_bytes: 20480
+  
   session_max_tokens: 120000
   session_compress_threshold: 80000
   recent_history_tokens: 30000

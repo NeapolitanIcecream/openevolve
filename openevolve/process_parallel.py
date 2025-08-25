@@ -15,7 +15,7 @@ import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Dict, List, Optional, Union, cast, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, cast, TYPE_CHECKING
 
 from openevolve.config import Config, LLMModelConfig
 from openevolve.database import Program, ProgramDatabase
@@ -57,7 +57,6 @@ class SerializableResult:
     child_program_dict: Optional[Dict[str, Any]] = None
     parent_id: Optional[str] = None
     iteration_time: float = 0.0
-    artifacts: Optional[Dict[str, Union[str, bytes]]] = None
     iteration: int = 0
     error: Optional[str] = None
 
@@ -363,7 +362,6 @@ def _run_iteration_worker(
             child_program_dict=child_program.to_dict(),
             parent_id=parent.id,
             iteration_time=iteration_time,
-            artifacts=None,
             iteration=iteration,
         )
         
@@ -473,20 +471,7 @@ class ProcessParallelController:
                 list(island) for island in self.database.islands
             ],
             "current_island": self.database.current_island,
-            "artifacts": {},  # Will be populated selectively
         }
-        
-        # Include artifacts for programs that might be selected
-        # IMPORTANT: This limits artifacts (execution outputs/errors) to a subset of programs only.
-        # This does NOT affect program code - all programs are fully serialized above.
-        # Use configuration to limit snapshot size and avoid slow worker initialization.
-        # Workers can still evolve properly as they have access to ALL program code.
-        artifacts_map = cast(Dict[str, Dict[str, Union[str, bytes]]], snapshot["artifacts"]) 
-        limit = max(0, getattr(self.config.database, 'artifact_snapshot_programs_limit', 100))
-        for pid in list(self.database.programs.keys())[:limit]:
-            artifacts = self.database.get_artifacts(pid)
-            if artifacts:
-                artifacts_map[pid] = artifacts
         
         return snapshot
     
@@ -564,10 +549,6 @@ class ProcessParallelController:
                     
                     # Add to database
                     self.database.add(child_program, iteration=completed_iteration)
-                    
-                    # Store artifacts
-                    if result.artifacts:
-                        self.database.store_artifacts(child_program.id, result.artifacts)
                     
                     # Prompt logging not used in commit-based scaffold
                     
@@ -764,6 +745,5 @@ class ProcessParallelController:
             parent_prompt_diff=parent_diff,
             inspiration_diffs=inspiration_diffs,
             parent_metrics=parent.metrics or {},
-            artifacts=None,
             max_inspirations=getattr(self.config.prompt, 'max_inspirations', 2),
         )

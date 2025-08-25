@@ -29,7 +29,6 @@ This fork modernizes OpenEvolve into a full code agent that performs commit-base
 - LLM tool loop with: edit, read_file, read_many_files, glob, grep, ls, submit
 - MAP-Elites + island model (quality-diversity); default feature dimensions: complexity and diversity
 - MinHash-based diversity/similarity; configurable signature parameters
-- Artifacts side-channel for rich execution feedback
 - Checkpoints and resuming; live visualization web UI
 
 ## Installation
@@ -136,8 +135,7 @@ llm:
 
 prompt:
   system_message: "You are an expert software agent working inside a git worktree..."
-  include_artifacts: true
-  max_artifact_bytes: 20480
+  
   max_inspirations: 2
   session_max_tokens: 120000
   session_compress_threshold: 80000
@@ -162,7 +160,6 @@ evaluator:
   timeout: 300
   max_retries: 3
   parallel_evaluations: 1
-  enable_artifacts: true
   require_evaluate_before_commit: true
 ```
 

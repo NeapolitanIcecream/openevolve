@@ -37,10 +37,9 @@ export function showSidebarContent(d, fromHover = false) {
     if ((d.commit_hash && typeof d.commit_hash === 'string' && d.commit_hash.trim() !== '') || (d.prompt_diff && d.prompt_diff.trim() !== '') || (d.hash_diff && d.hash_diff.trim() !== '')) {
         tabNames.push('Commit');
     }
-    // Prompts/Artifacts selection: show if either has content
+    // Prompts tab shown only if prompts exist
     const hasPrompts = !!(d.prompts && typeof d.prompts === 'object' && Object.keys(d.prompts).length > 0);
-    const hasArtifacts = !!(d.artifacts_json && (typeof d.artifacts_json === 'string' ? d.artifacts_json.trim() !== '' : (typeof d.artifacts_json === 'object' && Object.keys(d.artifacts_json).length > 0)));
-    if (hasPrompts || hasArtifacts) tabNames.push('Prompts');
+    if (hasPrompts) tabNames.push('Prompts');
     const children = allNodeData.filter(n => n.parent_id === d.id);
     if (children.length > 0) tabNames.push('Children');
 
@@ -78,17 +77,7 @@ export function showSidebarContent(d, fromHover = false) {
                     }
                 }
             }
-            // Artifacts (stringified JSON or object)
-            if (d.artifacts_json) {
-                const optLabel = `artifacts`;
-                promptOptions.push(optLabel);
-                try {
-                    const parsed = (typeof d.artifacts_json === 'string') ? JSON.parse(d.artifacts_json) : d.artifacts_json;
-                    promptMap[optLabel] = typeof parsed === 'object' ? JSON.stringify(parsed, null, 2) : String(parsed);
-                } catch (e) {
-                    promptMap[optLabel] = (typeof d.artifacts_json === 'string') ? d.artifacts_json : JSON.stringify(d.artifacts_json, null, 2);
-                }
-            }
+            
             // Get last selected prompt from localStorage, or default to first
             let lastPromptKey = localStorage.getItem('sidebarPromptSelect') || promptOptions[0] || '';
             if (!promptMap[lastPromptKey]) lastPromptKey = promptOptions[0] || '';

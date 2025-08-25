@@ -158,13 +158,10 @@ def program_page(program_id):
         **program_data,
     }
 
-    artifacts_json = normalized.get("artifacts_json", None)
-
     return render_template(
         "program_page.html",
         program_data=normalized,
         checkpoint_dir=checkpoint_dir,
-        artifacts_json=artifacts_json,
     )
 
 

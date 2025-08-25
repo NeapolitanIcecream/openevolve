@@ -58,10 +58,7 @@ prompt:
   use_template_stochasticity: true
   template_variations: {}
 
-  # Artifacts surfaced in the prompt
-  include_artifacts: true
-  max_artifact_bytes: 20480            # 20KB in prompt
-  artifact_security_filter: true
+  
 
   # Inspirations in prompt context
   max_inspirations: 2
@@ -126,16 +123,10 @@ database:
   minhash_num_perm: 64
   minhash_shingle_len: 5
 
-  # Commit message and artifact snapshot
+  # Commit message
   commit_message_template: "OpenEvolve iteration {iteration} {commit_message} {metrics}"
   commit_message_max_metrics: 6
-  artifact_snapshot_programs_limit: 100
-
-  # Artifact storage
-  artifacts_base_path: null
-  artifact_size_threshold: 32768       # 32KB
-  cleanup_old_artifacts: true
-  artifact_retention_days: 30
+  
 
   # Random seed for database internals (defaults to top-level if null)
   random_seed: 42
@@ -165,9 +156,7 @@ evaluator:
   use_llm_feedback: false
   llm_feedback_weight: 0.1
 
-  # Artifact handling
-  enable_artifacts: true
-  max_artifact_storage: 104857600      # 100MB per individual
+  
 
   # Gate committing to repo until evaluation succeeds
   require_evaluate_before_commit: true

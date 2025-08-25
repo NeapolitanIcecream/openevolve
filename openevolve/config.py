@@ -150,11 +150,6 @@ class PromptConfig:
     use_meta_prompting: bool = False
     meta_prompt_weight: float = 0.1
 
-    # Artifact rendering
-    include_artifacts: bool = True
-    max_artifact_bytes: int = 20 * 1024  # 20KB in prompt
-    artifact_security_filter: bool = True
-
     # Inspirations in prompt context
     max_inspirations: int = 2
 
@@ -225,19 +220,12 @@ class DatabaseConfig:
     minhash_num_perm: int = 64
     minhash_shingle_len: int = 5
 
-    # Commit message and artifact snapshot
+    # Commit message
     commit_message_template: str = "OpenEvolve iteration {iteration} {commit_message} {metrics}"
     commit_message_max_metrics: int = 6
-    artifact_snapshot_programs_limit: int = 100
 
     # Random seed for reproducible sampling
     random_seed: Optional[int] = 42
-
-    # Artifact storage
-    artifacts_base_path: Optional[str] = None  # Defaults to db_path/artifacts
-    artifact_size_threshold: int = 32 * 1024  # 32KB threshold
-    cleanup_old_artifacts: bool = True
-    artifact_retention_days: int = 30
 
 
 @dataclass
@@ -263,10 +251,6 @@ class EvaluatorConfig:
     # LLM-based feedback
     use_llm_feedback: bool = False
     llm_feedback_weight: float = 0.1
-
-    # Artifact handling
-    enable_artifacts: bool = True
-    max_artifact_storage: int = 100 * 1024 * 1024  # 100MB per program
 
     # Commit gating
     require_evaluate_before_commit: bool = True
@@ -389,9 +373,6 @@ class Config:
                 "session_max_tokens": self.prompt.session_max_tokens,
                 "session_compress_threshold": self.prompt.session_compress_threshold,
                 "recent_history_tokens": self.prompt.recent_history_tokens,
-                "include_artifacts": self.prompt.include_artifacts,
-                "max_artifact_bytes": self.prompt.max_artifact_bytes,
-                "artifact_security_filter": self.prompt.artifact_security_filter,
                 "max_inspirations": self.prompt.max_inspirations,
                 # Note: meta-prompting features not implemented
                 # "use_meta_prompting": self.prompt.use_meta_prompting,
@@ -429,11 +410,6 @@ class Config:
                 "minhash_shingle_len": self.database.minhash_shingle_len,
                 "commit_message_template": self.database.commit_message_template,
                 "commit_message_max_metrics": self.database.commit_message_max_metrics,
-                "artifact_snapshot_programs_limit": self.database.artifact_snapshot_programs_limit,
-                "artifacts_base_path": self.database.artifacts_base_path,
-                "artifact_size_threshold": self.database.artifact_size_threshold,
-                "cleanup_old_artifacts": self.database.cleanup_old_artifacts,
-                "artifact_retention_days": self.database.artifact_retention_days,
             },
             "evaluator": {
                 "timeout": self.evaluator.timeout,
@@ -448,8 +424,6 @@ class Config:
                 # "distributed": self.evaluator.distributed,
                 "use_llm_feedback": self.evaluator.use_llm_feedback,
                 "llm_feedback_weight": self.evaluator.llm_feedback_weight,
-                "enable_artifacts": self.evaluator.enable_artifacts,
-                "max_artifact_storage": self.evaluator.max_artifact_storage,
                 "require_evaluate_before_commit": self.evaluator.require_evaluate_before_commit,
             },
         }
