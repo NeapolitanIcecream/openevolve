@@ -8,3 +8,4 @@ from .ls import LSTool
 from .registry import ToolRegistry
 from .lint_file import LintFileTool
 from .submit import SubmitTool
+from .write_file import WriteFileTool

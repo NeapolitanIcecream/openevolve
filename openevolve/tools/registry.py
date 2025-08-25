@@ -19,6 +19,7 @@ from .glob import GlobTool
 from .grep import GrepTool
 from .ls import LSTool
 from .lint_file import LintFileTool
+from .write_file import WriteFileTool
 
 
 # A simple type alias for the config object for now.
@@ -145,6 +146,9 @@ class ToolRegistry:
         elif self.llm_client is not None:
             self.register_tool(EditTool(root_dir=root_dir, llm_client=self.llm_client))
         
+        # WriteFileTool does not require an LLM client
+        self.register_tool(WriteFileTool(root_dir=root_dir))
+
         self.register_tool(ReadFileTool(config=self.tool_config))
         self.register_tool(ReadManyFilesTool(config=self.tool_config))
         # File system discovery tools
