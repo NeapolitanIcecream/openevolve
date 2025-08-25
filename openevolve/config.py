@@ -62,6 +62,8 @@ class LLMConfig:
             LLMModelConfig(name="gpt-4o", weight=0.2),
         ]
     )
+    # TODO: The evaluator_models parameter is used to support "LLM as an Evaluator."
+    # This feature is planned for low-priority support.
     evaluator_models: List[LLMModelConfig] = field(default_factory=lambda: [])
 
     # Optional dedicated models
@@ -370,8 +372,8 @@ class Config:
                     "retry_delay": self.llm.defaults.retry_delay,
                     "random_seed": self.llm.defaults.random_seed,
                 },
-                "models": self.llm.models,
-                "evaluator_models": self.llm.evaluator_models,
+                "models": [asdict(m) for m in self.llm.models],
+                "evaluator_models": [asdict(m) for m in self.llm.evaluator_models],
                 "write_tool_model": asdict(self.llm.write_tool_model) if self.llm.write_tool_model else None,
                 "compression_model": asdict(self.llm.compression_model) if self.llm.compression_model else None,
                 "tool_loop_max_steps": self.llm.tool_loop_max_steps,
