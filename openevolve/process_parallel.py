@@ -15,9 +15,9 @@ import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, asdict
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Union, cast, TYPE_CHECKING
 
-from openevolve.config import Config
+from openevolve.config import Config, LLMModelConfig
 from openevolve.database import Program, ProgramDatabase
 from openevolve.evaluator import Evaluator
 from openevolve.llm.openai import OpenAILLM
@@ -25,8 +25,30 @@ from openevolve.llm.session import ConversationSession
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.llm.base import IterationRunResult
 from openevolve.prompt.sampler import PromptSampler
+from openevolve.utils.git_utils import (
+    configure_repo_defaults,
+    create_worktree,
+    ensure_clean_worktree,
+    checkout_branch_at,
+    create_commit_from_worktree,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# --- Worker-scoped globals (typed) ---
+if TYPE_CHECKING:
+    from openevolve.tools.registry import ToolRegistry
+    from openevolve.llm.base import LLMInterface
+
+_worker_config: Optional[Config] = None
+_worker_evaluation_file: str = ""
+_worker_evaluator: Optional[Evaluator] = None
+_worker_llm_ensemble: Optional[LLMEnsemble] = None
+_worker_prompt_sampler: Optional[PromptSampler] = None
+_worker_registry: Optional["ToolRegistry"] = None
+_worker_llm: Optional["LLMInterface"] = None
+_worker_session: Optional[ConversationSession] = None
 
 
 @dataclass
@@ -35,7 +57,7 @@ class SerializableResult:
     child_program_dict: Optional[Dict[str, Any]] = None
     parent_id: Optional[str] = None
     iteration_time: float = 0.0
-    artifacts: Optional[Dict[str, Any]] = None
+    artifacts: Optional[Dict[str, Union[str, bytes]]] = None
     iteration: int = 0
     error: Optional[str] = None
 
@@ -60,9 +82,7 @@ class WorktreePool:
         os.makedirs(self.base_dir, exist_ok=True)
 
         # Reduce lock contention and ensure commits work without relying on global config
-        self._git_repo(["config", "gc.auto", "0"], check=False)
-        self._git_repo(["config", "user.name", git_user_name], check=False)
-        self._git_repo(["config", "user.email", git_user_email], check=False)
+        configure_repo_defaults(self.repo_path, git_user_name, git_user_email)
 
         self.slots: List[str] = []
         self._in_use: Dict[str, bool] = {}
@@ -78,18 +98,9 @@ class WorktreePool:
             f"WorktreePool initialized with {len(self.slots)} worktrees under {self.base_dir}"
         )
 
-    def _git_repo(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-        from openevolve.utils.git_utils import _run_git  # type: ignore
-        proc = _run_git(self.repo_path, args)
-        if check and proc.returncode != 0:
-            raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr or proc.stdout}")
-        return proc
-
     def _create_worktree(self, wt_dir: str) -> None:
         os.makedirs(os.path.dirname(wt_dir), exist_ok=True)
-        proc = self._git_repo(["worktree", "add", "--detach", wt_dir, self.base_commit])
-        if proc.returncode != 0:
-            raise RuntimeError(f"failed to create worktree {wt_dir}: {proc.stderr}")
+        create_worktree(self.repo_path, wt_dir, self.base_commit, detach=True)
         logger.debug(f"Created worktree {wt_dir} at {self.base_commit}")
 
     def acquire(self) -> Optional[str]:
@@ -187,18 +198,22 @@ def _lazy_init_worker_components():
     global _worker_registry
     global _worker_llm
     global _worker_session
+    global _worker_config
+    
+    assert _worker_config is not None, "Worker config not initialized"
+    cfg: Config = _worker_config
     
     if _worker_llm_ensemble is None:
-        _worker_llm_ensemble = LLMEnsemble(_worker_config.llm.models)
+        _worker_llm_ensemble = LLMEnsemble(cfg.llm.models)
 
     if _worker_prompt_sampler is None:
         from openevolve.prompt.sampler import PromptSampler
-        _worker_prompt_sampler = PromptSampler(_worker_config.prompt)
+        _worker_prompt_sampler = PromptSampler(cfg.prompt)
 
     if _worker_evaluator is None:
         from openevolve.evaluator import Evaluator
         _worker_evaluator = Evaluator(
-            _worker_config.evaluator,
+            cfg.evaluator,
             _worker_evaluation_file,
             database=None,
         )
@@ -206,34 +221,36 @@ def _lazy_init_worker_components():
     # Singleton ToolRegistry and LLM (internal history disabled)
     if _worker_registry is None:
         from openevolve.tools.registry import ToolRegistry
-        _worker_registry = ToolRegistry(config={"root_dir": _worker_config.database.git_repo_path}, evaluator=_worker_evaluator)
+        _worker_registry = ToolRegistry(config={"root_dir": cfg.database.git_repo_path}, evaluator=_worker_evaluator)
 
     if _worker_llm is None:
         # Decide the main working client: single model -> OpenAILLM; multiple -> Ensemble
-        if len(_worker_config.llm.models) <= 1:
-            _worker_llm = OpenAILLM(_worker_config.llm.models[0], tool_registry=_worker_registry)
+        if len(cfg.llm.models) <= 1:
+            _worker_llm = OpenAILLM(cfg.llm.models[0], tool_registry=_worker_registry)
         else:
-            _worker_llm = LLMEnsemble(_worker_config.llm.models, tool_registry=_worker_registry)
-        _worker_llm.attach_session(_worker_session)  # type: ignore[attr-defined]
+            _worker_llm = LLMEnsemble(cfg.llm.models, tool_registry=_worker_registry)
+        assert _worker_session is not None
+        _worker_llm.attach_session(_worker_session)
         _worker_registry.set_llm_client(_worker_llm)
 
         # Prepare dedicated write tool client if configured
         write_cfg = None
-        if getattr(_worker_config.llm, "write_tool_model", None) is not None:
-            write_cfg = _worker_config.llm.write_tool_model
+        if getattr(cfg.llm, "write_tool_model", None) is not None:
+            write_cfg = cfg.llm.write_tool_model
         # Build write LLM client
         if write_cfg is None:
             # Fallback: use the main working client (ensemble or single)
             write_llm_client = _worker_llm
         else:
             write_llm_client = OpenAILLM(write_cfg, tool_registry=_worker_registry)
+            assert _worker_session is not None
             write_llm_client.attach_session(_worker_session)
         _worker_registry.set_write_llm_client(write_llm_client)
 
 
 def _run_iteration_worker(
     iteration: int,
-    db_snapshot: Dict[str, Any],
+    db_snapshot: Dict[str, object],
     parent_id: str,
     inspiration_ids: List[str],
     worktree_dir: str,
@@ -247,27 +264,19 @@ def _run_iteration_worker(
         _lazy_init_worker_components()
 
         # Reconstruct programs from snapshot
-        programs = {
-            pid: Program(**prog_dict) 
-            for pid, prog_dict in db_snapshot.get("programs", {}).items()
-        }
+        prog_map = cast(Dict[str, Dict[str, Any]], db_snapshot.get("programs", {}))
+        programs = {pid: Program.from_dict(prog_dict) for pid, prog_dict in prog_map.items()}
         
         parent = programs[parent_id]
 
         # Start timer
         iteration_start = time.time()
 
-        # Git helpers scoped to worktree
-        def git(*args: str) -> subprocess.CompletedProcess[str]:
-            from openevolve.utils.git_utils import _run_git  # type: ignore
-            return _run_git(worktree_dir, list(args))
-
         # Ensure clean working tree
-        git("reset", "--hard")
-        git("clean", "-fd")
+        ensure_clean_worktree(worktree_dir)
 
         # Checkout unique branch at parent commit
-        proc = git("checkout", "-B", branch_name, parent_commit)
+        proc = checkout_branch_at(worktree_dir, branch_name, parent_commit, force=True)
         if proc.returncode != 0:
             return SerializableResult(error=f"git checkout failed: {proc.stderr}", iteration=iteration)
 
@@ -275,15 +284,14 @@ def _run_iteration_worker(
         # Bind this iteration's root directory to the registry (update root_dir)
         assert _worker_registry is not None, "ToolRegistry is not initialized"
         assert _worker_llm is not None, "LLM is not initialized"
-        if hasattr(_worker_registry, "tool_config"):
-            _worker_registry.tool_config.root_dir = worktree_dir  # type: ignore[attr-defined]
-        if hasattr(_worker_registry, "config"):
-            _worker_registry.config["root_dir"] = worktree_dir  # type: ignore[index]
+        _worker_registry.tool_config.root_dir = worktree_dir
+        _worker_registry.config["root_dir"] = worktree_dir
 
         # Let the LLM layer run the full tool loop and maintain history
         # Build compression client if configured
         compression_client = None
-        comp_cfg = None
+        comp_cfg: Optional[LLMModelConfig] = None
+        assert _worker_config is not None
         if getattr(_worker_config.llm, "compression_model", None) is not None:
             comp_cfg = _worker_config.llm.compression_model
         if comp_cfg is not None:
@@ -299,7 +307,7 @@ def _run_iteration_worker(
                 max_steps=getattr(_worker_config.llm, 'tool_loop_max_steps', 30),
             )
         )
-        metrics: Dict[str, Any] = run_out.get("metrics") or {}
+        metrics: Dict[str, object] = cast(Dict[str, object], run_out.get("metrics") or {})
         did_evaluate: bool = bool(run_out.get("did_evaluate"))
         provided_commit_message: Optional[str] = run_out.get("commit_message")
 
@@ -325,16 +333,20 @@ def _run_iteration_worker(
             metrics=commit_metrics,
             commit_message=(provided_commit_message or '').strip(),
         ).strip()
-        from openevolve.utils.git_utils import create_commit_from_worktree
         child_hash = create_commit_from_worktree(worktree_dir, commit_msg)
 
         # Create child program (DB will compute diffs/signatures)
+        # Keep only numeric metrics for Program schema
+        typed_metrics: Dict[str, float] = {
+            k: float(v) for k, v in metrics.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
         child_program = Program(
             id=str(uuid.uuid4()),
             commit_hash=child_hash,
             parent_id=parent.id,
             generation=parent.generation + 1,
-            metrics=metrics or {},
+            metrics=typed_metrics,
             iteration_found=iteration,
             language=getattr(_worker_config, "language", "python") or "python",
             metadata={
@@ -381,17 +393,13 @@ class ProcessParallelController:
         
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
     
-    def _serialize_config(self, config: Config) -> Dict[str, Any]:
+    def _serialize_config(self, config: Config) -> Dict[str, object]:
         """Serialize config object to a dictionary that can be pickled"""
         # Manual serialization to handle nested objects properly
-        def _maybe_asdict_model(m: Optional[LLMModelConfig]) -> Optional[Dict[str, Any]]:  # type: ignore[name-defined]
-            try:
-                from openevolve.config import LLMModelConfig as _LLMModelConfig  # type: ignore
-                if isinstance(m, _LLMModelConfig):
-                    return asdict(cast(Any, m))
-            except Exception:
-                pass
-            return None
+        def _maybe_asdict_model(m: Optional[LLMModelConfig]) -> Optional[Dict[str, object]]:
+            if m is None:
+                return None
+            return asdict(m)  # dataclass -> Dict[str, object]
 
         return {
             'llm': {
@@ -453,10 +461,10 @@ class ProcessParallelController:
         logger.info("Graceful shutdown requested...")
         self.shutdown_event.set()
     
-    def _create_database_snapshot(self) -> Dict[str, Any]:
+    def _create_database_snapshot(self) -> Dict[str, object]:
         """Create a serializable snapshot of the database state"""
         # Only include necessary data for workers
-        snapshot: Dict[str, Any] = {
+        snapshot: Dict[str, object] = {
             "programs": {
                 pid: prog.to_dict() 
                 for pid, prog in self.database.programs.items()
@@ -473,7 +481,7 @@ class ProcessParallelController:
         # This does NOT affect program code - all programs are fully serialized above.
         # Use configuration to limit snapshot size and avoid slow worker initialization.
         # Workers can still evolve properly as they have access to ALL program code.
-        artifacts_map: Dict[str, Any] = cast(Dict[str, Any], snapshot["artifacts"])  # type: ignore[index]
+        artifacts_map = cast(Dict[str, Dict[str, Union[str, bytes]]], snapshot["artifacts"]) 
         limit = max(0, getattr(self.config.database, 'artifact_snapshot_programs_limit', 100))
         for pid in list(self.database.programs.keys())[:limit]:
             artifacts = self.database.get_artifacts(pid)

@@ -122,3 +122,55 @@ def create_commit_from_worktree(
     return get_head(repo_path)
 
 
+def configure_repo_defaults(
+    repo_path: str, git_user_name: str, git_user_email: str
+) -> None:
+    """Set repo-scoped defaults used by OpenEvolve.
+
+    - Disable auto-gc to reduce lock contention in parallel operations
+    - Set user.name and user.email to ensure commits succeed without global config
+    """
+    _run_git(repo_path, ["config", "gc.auto", "0"])  # best-effort
+    _run_git(repo_path, ["config", "user.name", git_user_name])  # best-effort
+    _run_git(repo_path, ["config", "user.email", git_user_email])  # best-effort
+
+
+def create_worktree(
+    repo_path: str, worktree_dir: str, base_ref: str, detach: bool = True
+) -> None:
+    """Create a git worktree at worktree_dir starting from base_ref.
+
+    Raises RuntimeError on failure.
+    """
+    args: List[str] = ["worktree", "add"]
+    if detach:
+        args.append("--detach")
+    args.extend([worktree_dir, base_ref])
+    proc = _run_git(repo_path, args)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"failed to create worktree {worktree_dir}: {proc.stderr or proc.stdout}"
+        )
+
+
+def ensure_clean_worktree(repo_path: str) -> None:
+    """Reset and clean the working tree to a pristine state.
+
+    Best-effort; does not raise on non-zero return codes.
+    """
+    _run_git(repo_path, ["reset", "--hard"])  # best-effort
+    _run_git(repo_path, ["clean", "-fd"])  # best-effort
+
+
+def checkout_branch_at(
+    repo_path: str, branch_name: str, start_ref: str, force: bool = True
+) -> subprocess.CompletedProcess:
+    """Checkout branch at a specific start_ref.
+
+    Uses `git checkout -B` when force=True (reset or create), else `-b`.
+    Returns the completed process so callers can check return codes.
+    """
+    args: List[str] = ["checkout", "-B" if force else "-b", branch_name, start_ref]
+    return _run_git(repo_path, args)
+
+
