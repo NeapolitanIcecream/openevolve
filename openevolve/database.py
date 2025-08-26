@@ -10,7 +10,9 @@ import time
 import uuid
 import hashlib
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Tuple, cast, TypedDict
+from typing import Any, Dict, List, Optional, Set, Tuple, cast, TypedDict, Deque
+from collections import deque
+import math
 
 from openevolve.config import DatabaseConfig
 from openevolve.utils.metrics_utils import safe_numeric_average
@@ -31,7 +33,6 @@ class DiversityCacheEntry(TypedDict):
 class FeatureStats(TypedDict):
     min: float
     max: float
-    values: List[float]
  
 @dataclass
 class Program:
@@ -185,6 +186,34 @@ class ProgramDatabase:
         # Feature scaling infrastructure
         self.feature_stats: Dict[str, FeatureStats] = {}
         self.feature_scaling_method: str = getattr(config, "feature_scaling_method", "minmax")
+
+        # Sliding window + periodic recompute configuration
+        self.feature_stats_window_size: int = int(
+            getattr(config, "feature_stats_window_size", 5000)
+        )
+        self.feature_stats_recompute_interval: int = int(
+            getattr(config, "feature_stats_recompute_interval", 500)
+        )
+        self.feature_stats_min_samples: int = int(
+            getattr(config, "feature_stats_min_samples", 50)
+        )
+        # Robust scaling quantiles (inclusive lower, upper)
+        self.feature_stats_robust_low_q: float = float(
+            getattr(config, "feature_stats_robust_low_q", 0.05)
+        )
+        self.feature_stats_robust_high_q: float = float(
+            getattr(config, "feature_stats_robust_high_q", 0.95)
+        )
+        # Optional per-dimension scaling override
+        self.feature_scaling_method_per_dim: Dict[str, str] = cast(
+            Dict[str, str], getattr(config, "feature_scaling_method_per_dim", {})
+        )
+
+        # In-memory sliding window buffers and caches (not persisted)
+        self._feature_value_buffer: Dict[str, Deque[float]] = {}
+        self._feature_updates_since_recompute: Dict[str, int] = {}
+        # Cache structure per feature: { "min", "max", "q_low", "q_high", "mean", "std" }
+        self._feature_stats_cache: Dict[str, Dict[str, float]] = {}
 
         # Per-dimension bins support
         if hasattr(config, "feature_bins") and isinstance(config.feature_bins, dict):
@@ -1865,19 +1894,24 @@ class ProgramDatabase:
             self.feature_stats[feature_name] = {
                 "min": value,
                 "max": value,
-                "values": [],  # Keep recent values for percentile calculation if needed
             }
 
         stats = self.feature_stats[feature_name]
         stats["min"] = min(stats["min"], value)
         stats["max"] = max(stats["max"], value)
 
-        # Keep recent values for more sophisticated scaling methods
-        values_list = stats["values"]
-        values_list.append(value)
-        stats["values"] = values_list
-        if len(stats["values"]) > 1000:  # Limit memory usage
-            stats["values"] = stats["values"][-1000:]
+        # Sliding window buffer for robust/modern scaling (not persisted)
+        buf = self._feature_value_buffer.get(feature_name)
+        if buf is None:
+            buf = deque(maxlen=self.feature_stats_window_size)
+            self._feature_value_buffer[feature_name] = buf
+        buf.append(float(value))
+
+        # Periodic recompute scheduling (purely periodic, no population-change triggers)
+        self._feature_updates_since_recompute[feature_name] = (
+            self._feature_updates_since_recompute.get(feature_name, 0) + 1
+        )
+        self._maybe_recompute_feature_stats(feature_name)
 
     def _scale_feature_value(self, feature_name: str, value: float) -> float:
         """
@@ -1890,42 +1924,75 @@ class ProgramDatabase:
         Returns:
             Scaled value in range [0, 1]
         """
-        if feature_name not in self.feature_stats:
-            # No stats yet, return normalized by a reasonable default
-            return min(1.0, max(0.0, value))
+        method = self._get_scaling_method_for_dim(feature_name)
 
-        stats = self.feature_stats[feature_name]
+        # Prefer cached window stats when available
+        cache = self._feature_stats_cache.get(feature_name, {})
 
-        if self.feature_scaling_method == "minmax":
-            # Min-max normalization to [0, 1]
-            min_val = stats["min"]
-            max_val = stats["max"]
+        # Robust scaling (recommended default)
+        if method == "robust":
+            q_low = cache.get("q_low")
+            q_high = cache.get("q_high")
+            if q_low is None or q_high is None:
+                # Not enough stats yet; fall back to minmax
+                return self._scale_feature_value_minmax(feature_name, value)
+            if q_high <= q_low:
+                return 0.5
+            scaled = (float(value) - q_low) / (q_high - q_low)
+            return min(1.0, max(0.0, scaled))
 
+        # Min-max scaling
+        if method == "minmax":
+            # Use cached min/max if present, else legacy stats
+            min_val = cache.get("min")
+            max_val = cache.get("max")
+            if min_val is None or max_val is None:
+                # Legacy stats fallback
+                if feature_name not in self.feature_stats:
+                    return min(1.0, max(0.0, float(value)))
+                stats = self.feature_stats[feature_name]
+                min_val = stats["min"]
+                max_val = stats["max"]
             if max_val == min_val:
-                return 0.5  # All values are the same
+                return 0.5
+            scaled = (float(value) - float(min_val)) / (float(max_val) - float(min_val))
+            return min(1.0, max(0.0, scaled))
 
-            scaled = (value - min_val) / (max_val - min_val)
-            return min(1.0, max(0.0, scaled))  # Ensure in [0, 1]
-
-        elif self.feature_scaling_method == "percentile":
-            # Use percentile ranking
-            values = stats["values"]
+        # Percentile rank in current window
+        if method == "percentile":
+            values = list(self._feature_value_buffer.get(feature_name, []))
             if not values:
                 return 0.5
+            # Linear scan rank (W is small, default 5000)
+            count = sum(1 for v in values if v <= float(value))
+            return count / len(values)
 
-            # Count how many values are less than or equal to this value
-            count = sum(1 for v in values if v <= value)
-            percentile = count / len(values)
-            return percentile
+        # Z-score scaling mapped to [0,1] using erf
+        if method == "zscore":
+            mean = cache.get("mean")
+            std = cache.get("std")
+            if mean is None or std is None or std == 0:
+                return 0.5
+            z = (float(value) - mean) / std
+            # Map via standard normal CDF approximation using erf
+            return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-        else:
-            # Default to min-max if unknown method
-            return self._scale_feature_value_minmax(feature_name, value)
+        # Unknown method -> fallback to minmax
+        return self._scale_feature_value_minmax(feature_name, value)
 
     def _scale_feature_value_minmax(self, feature_name: str, value: float) -> float:
         """Helper for min-max scaling"""
+        cache = self._feature_stats_cache.get(feature_name)
+        if cache is not None and "min" in cache and "max" in cache:
+            min_val = cache["min"]
+            max_val = cache["max"]
+            if max_val == min_val:
+                return 0.5
+            scaled = (float(value) - min_val) / (max_val - min_val)
+            return min(1.0, max(0.0, scaled))
+
         if feature_name not in self.feature_stats:
-            return min(1.0, max(0.0, value))
+            return min(1.0, max(0.0, float(value)))
 
         stats = self.feature_stats[feature_name]
         min_val = stats["min"]
@@ -1934,8 +2001,66 @@ class ProgramDatabase:
         if max_val == min_val:
             return 0.5
 
-        scaled = (value - min_val) / (max_val - min_val)
+        scaled = (float(value) - min_val) / (max_val - min_val)
         return min(1.0, max(0.0, scaled))
+
+    # ---------------- Feature scaling recompute helpers ----------------
+    def _get_scaling_method_for_dim(self, feature_name: str) -> str:
+        try:
+            override = self.feature_scaling_method_per_dim.get(feature_name)
+        except Exception:
+            override = None
+        return override or self.feature_scaling_method
+
+    def _maybe_recompute_feature_stats(self, feature_name: str) -> None:
+        updates = int(self._feature_updates_since_recompute.get(feature_name, 0))
+        buf = self._feature_value_buffer.get(feature_name)
+        if not buf:
+            return
+        if len(buf) < self.feature_stats_min_samples:
+            return
+        if updates >= self.feature_stats_recompute_interval:
+            self._recompute_feature_stats(feature_name)
+            self._feature_updates_since_recompute[feature_name] = 0
+
+    def _recompute_feature_stats(self, feature_name: str) -> None:
+        buf = self._feature_value_buffer.get(feature_name)
+        if not buf:
+            return
+        values = list(buf)
+        if not values:
+            return
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        def _quantile(q: float) -> float:
+            if n == 1:
+                return sorted_vals[0]
+            q = min(1.0, max(0.0, q))
+            pos = q * (n - 1)
+            lo = int(math.floor(pos))
+            hi = int(math.ceil(pos))
+            if lo == hi:
+                return sorted_vals[lo]
+            frac = pos - lo
+            return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+        min_v = sorted_vals[0]
+        max_v = sorted_vals[-1]
+        low_q = _quantile(self.feature_stats_robust_low_q)
+        high_q = _quantile(self.feature_stats_robust_high_q)
+        mean_v = sum(values) / n
+        # numerically-stable two-pass variance (n could be up to 5000)
+        var = sum((x - mean_v) * (x - mean_v) for x in values) / n
+        std_v = math.sqrt(var) if var > 0 else 0.0
+
+        self._feature_stats_cache[feature_name] = {
+            "min": float(min_v),
+            "max": float(max_v),
+            "q_low": float(low_q),
+            "q_high": float(high_q),
+            "mean": float(mean_v),
+            "std": float(std_v),
+        }
 
     def log_island_status(self) -> None:
         """Log current status of all islands"""

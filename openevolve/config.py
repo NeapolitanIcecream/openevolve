@@ -213,6 +213,13 @@ class DatabaseConfig:
     island_diversity_max_comparisons: int = 6
     diversity_cache_size: int = 1000
     feature_scaling_method: str = "minmax"
+    # --- Feature statistics (sliding window & robust scaling) ---
+    feature_stats_window_size: int = 5000
+    feature_stats_recompute_interval: int = 500
+    feature_stats_min_samples: int = 50
+    feature_stats_robust_low_q: float = 0.05
+    feature_stats_robust_high_q: float = 0.95
+    feature_scaling_method_per_dim: Dict[str, str] = field(default_factory=dict)
 
     # MinHash signature settings
     minhash_num_perm: int = 64
@@ -411,6 +418,13 @@ class Config:
                 "island_diversity_max_comparisons": self.database.island_diversity_max_comparisons,
                 "diversity_cache_size": self.database.diversity_cache_size,
                 "feature_scaling_method": self.database.feature_scaling_method,
+                # Feature statistics (sliding window & robust scaling)
+                "feature_stats_window_size": self.database.feature_stats_window_size,
+                "feature_stats_recompute_interval": self.database.feature_stats_recompute_interval,
+                "feature_stats_min_samples": self.database.feature_stats_min_samples,
+                "feature_stats_robust_low_q": self.database.feature_stats_robust_low_q,
+                "feature_stats_robust_high_q": self.database.feature_stats_robust_high_q,
+                "feature_scaling_method_per_dim": self.database.feature_scaling_method_per_dim,
                 "minhash_num_perm": self.database.minhash_num_perm,
                 "minhash_shingle_len": self.database.minhash_shingle_len,
                 "commit_message_template": self.database.commit_message_template,

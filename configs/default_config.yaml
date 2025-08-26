@@ -115,6 +115,13 @@ database:
   island_diversity_max_comparisons: 6
   diversity_cache_size: 1000
   feature_scaling_method: "minmax"
+  # Feature statistics windowing & robust scaling (used for dynamic binning)
+  feature_stats_window_size: 5000           # Sliding window size per feature
+  feature_stats_recompute_interval: 500     # Recompute cached stats every N updates
+  feature_stats_min_samples: 50             # Min samples before using window-based stats
+  feature_stats_robust_low_q: 0.05          # Lower quantile for robust scaling
+  feature_stats_robust_high_q: 0.95         # Upper quantile for robust scaling
+  feature_scaling_method_per_dim: {}        # Optional per-dimension overrides e.g. {complexity: robust}
 
   # MinHash signature
   minhash_num_perm: 64
