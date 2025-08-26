@@ -12,6 +12,7 @@ import multiprocessing as mp
 import os
 import subprocess
 import time
+import hashlib
 import uuid
 from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, asdict
@@ -267,6 +268,16 @@ def _run_iteration_worker(
         programs = {pid: Program.from_dict(prog_dict) for pid, prog_dict in prog_map.items()}
         
         parent = programs[parent_id]
+        
+        # Build exact-dedup keys from snapshot (SHA1 over normalized diffs)
+        dedup_keys: set[str] = set()
+        for p in programs.values():
+            text = (p.hash_diff or p.prompt_diff or "")
+            if text:
+                try:
+                    dedup_keys.add(hashlib.sha1(text.encode("utf-8")).hexdigest())
+                except Exception:
+                    pass
 
         # Start timer
         iteration_start = time.time()
@@ -285,6 +296,23 @@ def _run_iteration_worker(
         assert _worker_llm is not None, "LLM is not initialized"
         _worker_registry.tool_config.root_dir = worktree_dir
         _worker_registry.config["root_dir"] = worktree_dir
+        # Inject pre-eval dedup context for Submit tool
+        try:
+            # Enable exact dedup by default; near-dup not used at pre-eval stage
+            from openevolve.config import DatabaseConfig  # type: ignore
+            assert _worker_config is not None
+            dedup_exact_enabled = bool(getattr(_worker_config.database, 'dedup_exact_enabled', True))
+        except Exception:
+            dedup_exact_enabled = True
+        # Use root_commit for dedup consistency with DB's diff baseline
+        try:
+            assert _worker_config is not None
+            base_ref_for_dedup = _worker_config.database.root_commit
+        except Exception:
+            base_ref_for_dedup = parent_commit
+        _worker_registry.tool_config.other_config["base_ref"] = base_ref_for_dedup
+        _worker_registry.tool_config.other_config["dedup_exact_enabled"] = dedup_exact_enabled
+        _worker_registry.tool_config.other_config["dedup_keys"] = list(dedup_keys)
 
         # Let the LLM layer run the full tool loop and maintain history
         # Build compression client if configured
@@ -332,6 +360,11 @@ def _run_iteration_worker(
             metrics=commit_metrics,
             commit_message=(provided_commit_message or '').strip(),
         ).strip()
+        # If a pre-eval dedup marker exists, skip committing
+        skip_marker = os.path.join(worktree_dir, ".openevolve_skip_commit")
+        if os.path.exists(skip_marker):
+            return SerializableResult(error="Duplicate detected pre-eval; skipping commit", iteration=iteration)
+
         child_hash = create_commit_from_worktree(worktree_dir, commit_msg)
 
         # Create child program (DB will compute diffs/signatures)

@@ -167,8 +167,6 @@ class DatabaseConfig:
     db_path: Optional[str] = None  # Path to store database on disk
     in_memory: bool = True
 
-    # Prompt and response logging to programs/<id>.json
-    log_prompts: bool = True
 
     # Evolutionary parameters
     population_size: int = 1000
@@ -226,6 +224,16 @@ class DatabaseConfig:
 
     # Random seed for reproducible sampling
     random_seed: Optional[int] = 42
+
+    # --- Deduplication and migration diversity control ---
+    # Exact deduplication (strong): treat programs with identical normalized diffs as duplicates
+    dedup_exact_enabled: bool = True
+    # Near-duplicate filtering for migration (MinHash-based). Keeps diversity high across islands
+    dedup_near_enabled: bool = False
+    # Similarity threshold for near-dup detection (1.0 == identical signatures)
+    dedup_near_similarity_threshold: float = 0.98
+    # Size of target island reference set for migration-time near-dup filtering
+    migration_diversity_topk: int = 20
 
 
 @dataclass
@@ -395,7 +403,6 @@ class Config:
                 "migration_interval": self.database.migration_interval,
                 "migration_rate": self.database.migration_rate,
                 "random_seed": self.database.random_seed,
-                "log_prompts": self.database.log_prompts,
                 "evolution_target": self.database.evolution_target,
                 "signature_similarity_threshold": self.database.signature_similarity_threshold,
                 "num_inspirations": self.database.num_inspirations,
@@ -408,6 +415,11 @@ class Config:
                 "minhash_shingle_len": self.database.minhash_shingle_len,
                 "commit_message_template": self.database.commit_message_template,
                 "commit_message_max_metrics": self.database.commit_message_max_metrics,
+                # Deduplication and migration diversity
+                "dedup_exact_enabled": self.database.dedup_exact_enabled,
+                "dedup_near_enabled": self.database.dedup_near_enabled,
+                "dedup_near_similarity_threshold": self.database.dedup_near_similarity_threshold,
+                "migration_diversity_topk": self.database.migration_diversity_topk,
             },
             "evaluator": {
                 "timeout": self.evaluator.timeout,

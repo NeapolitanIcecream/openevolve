@@ -2,14 +2,15 @@
 Program database for OpenEvolve
 """
 
-import base64
 import json
 import logging
 import os
 import random
 import time
+import uuid
+import hashlib
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast, Mapping, TypedDict
+from typing import Any, Dict, List, Optional, Set, Tuple, cast, TypedDict
 
 from openevolve.config import DatabaseConfig
 from openevolve.utils.metrics_utils import safe_numeric_average
@@ -20,13 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 # -------- Typed helpers --------
-Numeric = Union[int, float]
-
-
-class PromptEntry(TypedDict, total=False):
-    system: str
-    user: str
-    responses: List[str]
 
 
 class DiversityCacheEntry(TypedDict):
@@ -38,24 +32,7 @@ class FeatureStats(TypedDict):
     min: float
     max: float
     values: List[float]
-
-
-def _safe_sum_metrics(metrics: Mapping[str, Numeric]) -> float:
-    """Safely sum only numeric metric values, ignoring strings and other types"""
-    numeric_values = [
-        v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
-    ]
-    return sum(numeric_values) if numeric_values else 0.0
-
-
-def _safe_avg_metrics(metrics: Mapping[str, Numeric]) -> float:
-    """Safely calculate average of only numeric metric values"""
-    numeric_values = [
-        v for v in metrics.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
-    ]
-    return sum(numeric_values) / max(1, len(numeric_values)) if numeric_values else 0.0
-
-
+ 
 @dataclass
 class Program:
     """Represents a program in the database"""
@@ -161,6 +138,11 @@ class ProgramDatabase:
         # Track the last iteration number (for resuming)
         self.last_iteration: int = 0
 
+        # Global exact-dedup set based on normalized diff hash (SHA1 of hash_diff/prompt_diff)
+        self.seen_equiv_keys: Set[str] = set()
+        # Optional mapping to the first program id seen for a given equivalence key
+        self.key_to_program_id: Dict[str, str] = {}
+
         # Configure persistence and optionally load from disk
         if self.persistence_enabled:
             # Use default db path if not provided: <git_repo_path>/.openevolve/db
@@ -185,8 +167,7 @@ class ProgramDatabase:
                     f"In-memory mode enabled; ignoring configured db_path for auto-load: {self.config.db_path}"
                 )
 
-        # Prompt log
-        self.prompts_by_program: Dict[str, Dict[str, PromptEntry]] = {}
+ 
 
         # Set random seed for reproducible sampling if specified
         if config.random_seed is not None:
@@ -347,6 +328,9 @@ class ProgramDatabase:
         # Update island-specific best program tracking
         self._update_island_best_program(program, island_idx)
 
+        # Register deduplication key after successful registration
+        self._register_equivalence_key(program)
+
         # Save to disk if persistence is enabled
         if self.persistence_enabled and self.config.db_path:
             self._save_program(program)
@@ -466,7 +450,8 @@ class ProgramDatabase:
 
         Args:
             n: Number of programs to return
-            metric: Metric to use for ranking (uses average if None)
+            metric: Metric to use for ranking. If None, uses combined_score when
+                all candidates have it; otherwise falls back to average of numeric metrics.
             island_idx: If specified, only return programs from this island
 
         Returns:
@@ -501,12 +486,20 @@ class ProgramDatabase:
                 reverse=True,
             )
         else:
-            # Sort by average of all numeric metrics
-            sorted_programs = sorted(
-                candidates,
-                key=lambda p: safe_numeric_average(p.metrics),
-                reverse=True,
-            )
+            # Default sorting: prefer combined_score when universally present
+            if candidates and all("combined_score" in p.metrics for p in candidates):
+                sorted_programs = sorted(
+                    candidates,
+                    key=lambda p: p.metrics["combined_score"],
+                    reverse=True,
+                )
+            else:
+                # Fallback to average of all numeric metrics
+                sorted_programs = sorted(
+                    candidates,
+                    key=lambda p: safe_numeric_average(p.metrics),
+                    reverse=True,
+                )
 
         return sorted_programs[:n]
 
@@ -533,14 +526,7 @@ class ProgramDatabase:
 
         # Save each program
         for program in self.programs.values():
-            prompts = None
-            if (
-                self.config.log_prompts
-                and self.prompts_by_program
-                and program.id in self.prompts_by_program
-            ):
-                prompts = self.prompts_by_program[program.id]
-            self._save_program(program, save_path, prompts=prompts)
+            self._save_program(program, save_path)
 
         # Save metadata
         metadata = {
@@ -553,6 +539,8 @@ class ProgramDatabase:
             "current_island": self.current_island,
             "island_generations": self.island_generations,
             "last_migration_generation": self.last_migration_generation,
+            # Persist dedup keys only when persistence is enabled
+            "seen_equiv_keys": list(self.seen_equiv_keys) if self.persistence_enabled else [],
         }
 
         with open(os.path.join(save_path, "metadata.json"), "w") as f:
@@ -589,6 +577,14 @@ class ProgramDatabase:
             self.current_island = metadata.get("current_island", 0)
             self.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
             self.last_migration_generation = metadata.get("last_migration_generation", 0)
+            # Restore dedup keys (guarded by persistence flag)
+            if self.persistence_enabled:
+                try:
+                    keys = metadata.get("seen_equiv_keys", [])
+                    if isinstance(keys, list):
+                        self.seen_equiv_keys = set(str(k) for k in keys)
+                except Exception as e:
+                    logger.warning(f"Failed to restore seen_equiv_keys: {e}")
 
             logger.info(f"Loaded database metadata with last_iteration={self.last_iteration}")
 
@@ -622,6 +618,10 @@ class ProgramDatabase:
 
         # Log the reconstructed island status
         self.log_island_status()
+
+        # If dedup keys are empty but we have programs, rebuild from programs on load
+        if not self.seen_equiv_keys and self.programs:
+            self._rebuild_seen_keys_from_programs()
 
     def _reconstruct_islands(self, saved_islands: List[List[str]]) -> None:
         """
@@ -716,7 +716,6 @@ class ProgramDatabase:
         self,
         program: Program,
         base_path: Optional[str] = None,
-        prompts: Optional[Dict[str, PromptEntry]] = None,
     ) -> None:
         """
         Save a program to disk
@@ -724,7 +723,6 @@ class ProgramDatabase:
         Args:
             program: Program to save
             base_path: Base path to save to (uses config.db_path if None)
-            prompts: Optional prompts to save with the program, in the format {template_key: { 'system': str, 'user': str }}
         """
         # Allow explicit snapshot path even in in-memory mode
         save_path = base_path or (self.config.db_path if self.persistence_enabled else None)
@@ -737,8 +735,6 @@ class ProgramDatabase:
 
         # Save program
         program_dict = program.to_dict()
-        if prompts:
-            program_dict["prompts"] = prompts
         program_path = os.path.join(programs_dir, f"{program.id}.json")
 
         with open(program_path, "w") as f:
@@ -1147,13 +1143,34 @@ class ProgramDatabase:
             if cast(Optional[int], self.programs[pid].metadata.get("island")) == self.current_island
         ]
 
-        if archive_programs_in_island:
-            parent_id = random.choice(archive_programs_in_island)
-            return self.programs[parent_id]
-        else:
-            # Fall back to any valid archive program if current island has none
-            parent_id = random.choice(valid_archive)
-            return self.programs[parent_id]
+        # Prefer island-local archive programs; else use any
+        candidate_ids = archive_programs_in_island or valid_archive
+
+        # Optional near-dup filtering using MinHash similarity before picking
+        if getattr(self.config, "dedup_near_enabled", False):
+            try:
+                threshold = float(getattr(self.config, "dedup_near_similarity_threshold", 0.98))
+            except Exception:
+                threshold = 0.98
+            # Build a small target set: top programs in current island
+            target_island = self.current_island
+            topK = max(1, int(getattr(self.config, "migration_diversity_topk", 20)))
+            target_programs = self.get_top_programs(n=topK, island_idx=target_island)
+            def _is_too_similar(pid: str) -> bool:
+                prog = self.programs[pid]
+                for tp in target_programs:
+                    if not prog.minhash_signature or not tp.minhash_signature:
+                        continue
+                    sim = minhash_similarity(prog.minhash_signature, tp.minhash_signature)
+                    if sim >= threshold:
+                        return True
+                return False
+            filtered = [pid for pid in candidate_ids if not _is_too_similar(pid)]
+            if filtered:
+                candidate_ids = filtered
+
+        parent_id = random.choice(candidate_ids)
+        return self.programs[parent_id]
 
     def _sample_random_parent(self) -> Program:
         """
@@ -1391,6 +1408,10 @@ class ProgramDatabase:
         max_generation = max(self.island_generations)
         return (max_generation - self.last_migration_generation) >= self.migration_interval
 
+    def _generate_migrant_id(self, base_id: str, target_island: int) -> str:
+        """Generate a UUID for a migrated program. The migrant nature is recorded in metadata."""
+        return str(uuid.uuid4())
+
     def migrate_programs(self) -> None:
         """
         Perform migration between islands
@@ -1406,48 +1427,75 @@ class ProgramDatabase:
             if len(island) == 0:
                 continue
 
-            # Select top programs from this island for migration
+            # Select candidate programs from this island for migration (sorted by fitness)
             island_programs = [self.programs[pid] for pid in island if pid in self.programs]
             if not island_programs:
                 continue
 
-            # Sort by fitness (using combined_score or average metrics)
             island_programs.sort(
                 key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
                 reverse=True,
             )
 
-            # Select top programs for migration
-            num_to_migrate = max(1, int(len(island_programs) * self.migration_rate))
-            migrants = island_programs[:num_to_migrate]
+            # Determine how many we want to migrate per target
+            desired = max(1, int(len(island_programs) * self.migration_rate))
 
-            # Migrate to adjacent islands (ring topology)
+            # Adjacent islands (ring topology)
             target_islands = [(i + 1) % len(self.islands), (i - 1) % len(self.islands)]
 
-            for migrant in migrants:
-                for target_island in target_islands:
-                    # Create a copy for migration (to avoid removing from source)
+            # Optional near-dup configuration
+            near_enabled = bool(getattr(self.config, "dedup_near_enabled", False))
+            try:
+                near_threshold = float(getattr(self.config, "dedup_near_similarity_threshold", 0.98))
+            except Exception:
+                near_threshold = 0.98
+            topK = max(1, int(getattr(self.config, "migration_diversity_topk", 20)))
+
+            for target_island in target_islands:
+                selected = 0
+                # Build a diversity reference set within target island
+                target_top = self.get_top_programs(n=topK, island_idx=target_island)
+
+                for candidate in island_programs:
+                    if selected >= desired:
+                        break
+
+                    # Create a copy for migration (avoid removing from source)
                     migrant_copy = Program(
-                        id=f"{migrant.id}_migrant_{target_island}",
-                        commit_hash=migrant.commit_hash,
-                        prompt_diff=migrant.prompt_diff,
-                        hash_diff=migrant.hash_diff,
-                        minhash_signature=migrant.minhash_signature.copy(),
-                        language=migrant.language,
-                        parent_id=migrant.id,
-                        generation=migrant.generation,
-                        metrics=migrant.metrics.copy(),
-                        metadata={**migrant.metadata, "island": target_island, "migrant": True},
+                        id=self._generate_migrant_id(candidate.id, target_island),
+                        commit_hash=candidate.commit_hash,
+                        prompt_diff=candidate.prompt_diff,
+                        hash_diff=candidate.hash_diff,
+                        minhash_signature=candidate.minhash_signature.copy(),
+                        language=candidate.language,
+                        parent_id=candidate.id,
+                        generation=candidate.generation,
+                        metrics=candidate.metrics.copy(),
+                        metadata={**candidate.metadata, "migrant": True, "source_island": i, "source_program_id": candidate.id},
                     )
 
-                    # Add to target island
-                    self.islands[target_island].add(migrant_copy.id)
-                    self.programs[migrant_copy.id] = migrant_copy
+                    # Exact dedup check (global)
+                    if self.is_duplicate(migrant_copy):
+                        continue
 
-                    # Update island-specific best program if migrant is better
-                    self._update_island_best_program(migrant_copy, target_island)
+                    # Near-dup check against target island top-K
+                    if near_enabled and migrant_copy.minhash_signature:
+                        too_similar = False
+                        for tp in target_top:
+                            if not tp.minhash_signature:
+                                continue
+                            sim = minhash_similarity(migrant_copy.minhash_signature, tp.minhash_signature)
+                            if sim >= near_threshold:
+                                too_similar = True
+                                break
+                        if too_similar:
+                            continue
 
-                    # Log migration with MAP-Elites coordinates
+                    # Register via unified add() to ensure indexes and constraints are applied
+                    self.add(migrant_copy, target_island=target_island)
+                    selected += 1
+
+                    # Optional: log MAP-Elites coordinates post-registration
                     feature_coords = self._calculate_feature_coords(migrant_copy)
                     coords_dict = {
                         self.config.feature_dimensions[j]: feature_coords[j]
@@ -1506,6 +1554,49 @@ class ProgramDatabase:
                     logger.warning(f"Island {i} best program {best_id} does not exist")
                 elif best_id not in self.islands[i]:
                     logger.warning(f"Island {i} best program {best_id} not in island")
+
+    # ---------------- Deduplication helpers ----------------
+    def _equivalence_key(self, program: Program) -> Optional[str]:
+        """Return a stable equivalence key for exact deduplication.
+
+        Uses SHA1 of normalized diff text (hash_diff or prompt_diff).
+        Returns None if no diff information is available.
+        """
+        text = program.hash_diff or program.prompt_diff
+        if not text:
+            return None
+        # Keep consistent normalization with clean_diff output
+        try:
+            return hashlib.sha1(text.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
+    def is_duplicate(self, program: Program) -> bool:
+        """Check if a program is an exact duplicate based on equivalence key."""
+        key = self._equivalence_key(program)
+        return bool(key and key in self.seen_equiv_keys)
+
+    def _register_equivalence_key(self, program: Program) -> None:
+        """Register a program's equivalence key after successful insertion."""
+        key = self._equivalence_key(program)
+        if key:
+            self.seen_equiv_keys.add(key)
+            # Remember the first program id for this key
+            if key not in self.key_to_program_id:
+                self.key_to_program_id[key] = program.id
+
+    def _rebuild_seen_keys_from_programs(self) -> None:
+        """Rebuild dedup keys from current programs (used on load when keys missing)."""
+        rebuilt = 0
+        for prog in self.programs.values():
+            key = self._equivalence_key(prog)
+            if key and key not in self.seen_equiv_keys:
+                self.seen_equiv_keys.add(key)
+                if key not in self.key_to_program_id:
+                    self.key_to_program_id[key] = prog.id
+                rebuilt += 1
+        if rebuilt:
+            logger.info(f"Rebuilt {rebuilt} dedup keys from programs on load")
 
     def _cleanup_stale_island_bests(self) -> None:
         """
@@ -1865,37 +1956,7 @@ class ProgramDatabase:
                 f"diversity={stat['diversity']:.2f}, gen={stat['generation']}{best_indicator}"
             )
 
-    def log_prompt(
-        self,
-        program_id: str,
-        template_key: str,
-        prompt: PromptEntry,
-        responses: Optional[List[str]] = None,
-    ) -> None:
-        """
-        Log a prompt for a program.
-        Only logs if self.config.log_prompts is True.
-
-        Args:
-        program_id: ID of the program to log the prompt for
-        template_key: Key for the prompt template
-        prompt: Prompts in the format {template_key: { 'system': str, 'user': str }}.
-        responses: Optional list of responses to the prompt, if available.
-        """
-
-        if not self.config.log_prompts:
-            return
-
-        if responses is None:
-            responses = []
-        prompt["responses"] = responses
-
-        if self.prompts_by_program is None:
-            self.prompts_by_program = {}
-
-        if program_id not in self.prompts_by_program:
-            self.prompts_by_program[program_id] = {}
-        self.prompts_by_program[program_id][template_key] = prompt
+ 
 
     # ---------------- Git helpers ----------------
 
