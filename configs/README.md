@@ -93,3 +93,25 @@ Alternatively, use only the config file (set `database.root_commit` etc. inside 
 ```bash
 uv run -m openevolve.cli /path/to/repo /path/to/evaluator.py --config my_config.yaml
 ```
+
+## Persistence vs In-Memory
+
+Runtime database persistence is controlled by `database.in_memory` and `database.db_path`:
+
+```yaml
+database:
+  in_memory: true          # default; no automatic disk IO during evolution
+  db_path: null            # ignored when in_memory=true
+```
+
+- In-memory (recommended default):
+  - No automatic loads/writes to `db_path` during evolution.
+  - Checkpoints still work and are saved under `<repo>/openevolve_output/checkpoints/checkpoint_<N>`.
+  - You can explicitly snapshot current state anywhere using the checkpoint mechanism.
+
+- Persistent mode:
+  - Set `in_memory: false`. If `db_path` is null, it defaults to `<repo>/.openevolve/db`.
+  - The database will auto-load on start (if present) and write program files/metadata incrementally.
+  - Checkpoints remain the authoritative, consistent snapshots used for resume and visualization.
+
+Tip: Use in-memory for speed and clean recovery semantics; rely on checkpoints for consistent, shareable states. Enable persistence only when you need ongoing on-disk traces.

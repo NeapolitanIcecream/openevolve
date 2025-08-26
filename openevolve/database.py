@@ -119,6 +119,10 @@ class ProgramDatabase:
     def __init__(self, config: DatabaseConfig):
         self.config = config
 
+        # Persistence switch controlled by config.in_memory
+        # When in_memory is True, we avoid automatic disk IO unless an explicit path is provided
+        self.persistence_enabled: bool = not getattr(config, "in_memory", True)
+
         # In-memory program storage
         self.programs: Dict[str, Program] = {}
 
@@ -157,9 +161,29 @@ class ProgramDatabase:
         # Track the last iteration number (for resuming)
         self.last_iteration: int = 0
 
-        # Load database from disk if path is provided
-        if config.db_path and os.path.exists(config.db_path):
-            self.load(config.db_path)
+        # Configure persistence and optionally load from disk
+        if self.persistence_enabled:
+            # Use default db path if not provided: <git_repo_path>/.openevolve/db
+            if not getattr(self.config, "db_path", None):
+                try:
+                    repo_path = getattr(self.config, "git_repo_path", ".") or "."
+                    repo_abs = os.path.abspath(repo_path)
+                    default_db_path = os.path.join(repo_abs, ".openevolve", "db")
+                    self.config.db_path = default_db_path
+                    logger.info(
+                        f"Persistence enabled and no db_path specified; using default path: {self.config.db_path}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to determine default db_path: {e}")
+
+            if self.config.db_path and os.path.exists(self.config.db_path):
+                self.load(self.config.db_path)
+        else:
+            # In-memory mode: ignore db_path for automatic loading
+            if getattr(self.config, "db_path", None):
+                logger.info(
+                    f"In-memory mode enabled; ignoring configured db_path for auto-load: {self.config.db_path}"
+                )
 
         # Prompt log
         self.prompts_by_program: Dict[str, Dict[str, PromptEntry]] = {}
@@ -323,8 +347,8 @@ class ProgramDatabase:
         # Update island-specific best program tracking
         self._update_island_best_program(program, island_idx)
 
-        # Save to disk if configured
-        if self.config.db_path:
+        # Save to disk if persistence is enabled
+        if self.persistence_enabled and self.config.db_path:
             self._save_program(program)
 
         logger.debug(f"Added program {program.id} to island {island_idx}")
@@ -494,6 +518,11 @@ class ProgramDatabase:
             path: Path to save to (uses config.db_path if None)
             iteration: Current iteration number
         """
+        # In-memory mode: only save when an explicit path is provided (e.g., checkpoint/snapshot)
+        if not self.persistence_enabled and path is None:
+            logger.info("In-memory mode: skipping save (no target path provided)")
+            return
+
         save_path = path or self.config.db_path
         if not save_path:
             logger.warning("No database path specified, skipping save")
@@ -697,7 +726,8 @@ class ProgramDatabase:
             base_path: Base path to save to (uses config.db_path if None)
             prompts: Optional prompts to save with the program, in the format {template_key: { 'system': str, 'user': str }}
         """
-        save_path = base_path or self.config.db_path
+        # Allow explicit snapshot path even in in-memory mode
+        save_path = base_path or (self.config.db_path if self.persistence_enabled else None)
         if not save_path:
             return
 
@@ -1884,3 +1914,16 @@ class ProgramDatabase:
             return "", ""
 
         return clean_diff(raw_diff)
+
+    # ---------------- Convenience APIs ----------------
+
+    def snapshot(self, path: str, iteration: int = 0) -> None:
+        """Write a one-off snapshot to path regardless of in-memory mode.
+
+        This is a thin wrapper over save(path=..., iteration=...).
+        """
+        try:
+            self.save(path=path, iteration=iteration)
+            logger.info(f"Snapshot saved to {path} (iteration={iteration})")
+        except Exception as e:
+            logger.warning(f"Snapshot failed for {path}: {e}")

@@ -69,8 +69,8 @@ prompt:
 # Database configuration
 database:
   # Persistence
-  db_path: null                        # Path to persist database (null = in-memory only)
-  in_memory: true                      # Keep database in memory for faster access
+  db_path: null                        # Persistence directory. Ignored when in_memory=true. If in_memory=false and null, defaults to <repo>/.openevolve/db
+  in_memory: true                      # In-memory mode: no automatic disk writes/loads; checkpoints still work (save(path))
   log_prompts: true                    # Log prompts/responses per individual
 
   # Evolutionary parameters
