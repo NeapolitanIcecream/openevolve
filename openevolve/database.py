@@ -170,12 +170,12 @@ class ProgramDatabase:
 
  
 
-        # Set random seed for reproducible sampling if specified
+        # Initialize instance RNG to avoid global random state pollution
         if config.random_seed is not None:
-            import random
-
-            random.seed(config.random_seed)
-            logger.debug(f"Database: Set random seed to {config.random_seed}")
+            self.rng = random.Random(config.random_seed)
+            logger.debug(f"Database: Initialized RNG with seed {config.random_seed}")
+        else:
+            self.rng = random.Random()
 
         # Diversity caching infrastructure
         self.diversity_cache: Dict[int, DiversityCacheEntry] = {}
@@ -1080,7 +1080,7 @@ class ProgramDatabase:
             Parent program from current island
         """
         # Use exploration_ratio and exploitation_ratio to decide sampling strategy
-        rand_val = random.random()
+        rand_val = self.rng.random()
 
         if rand_val < self.config.exploration_ratio:
             # EXPLORATION: Sample from current island (diverse sampling)
@@ -1137,7 +1137,7 @@ class ProgramDatabase:
                 return next(iter(self.programs.values()))
 
         # Sample from valid programs
-        parent_id = random.choice(valid_programs)
+        parent_id = self.rng.choice(valid_programs)
         return self.programs[parent_id]
 
     def _sample_exploitation_parent(self) -> Program:
@@ -1198,7 +1198,7 @@ class ProgramDatabase:
             if filtered:
                 candidate_ids = filtered
 
-        parent_id = random.choice(candidate_ids)
+        parent_id = self.rng.choice(candidate_ids)
         return self.programs[parent_id]
 
     def _sample_random_parent(self) -> Program:
@@ -1209,7 +1209,7 @@ class ProgramDatabase:
             raise ValueError("No programs available for sampling")
 
         # Sample randomly from all programs
-        program_id = random.choice(list(self.programs.keys()))
+        program_id = self.rng.choice(list(self.programs.keys()))
         return self.programs[program_id]
 
     def _sample_inspirations(self, parent: Program, n: int = 5) -> List[Program]:
@@ -1286,7 +1286,7 @@ class ProgramDatabase:
             for _ in range(remaining_slots * 3):  # Try more times to find nearby programs
                 # Perturb coordinates
                 perturbed_coords = [
-                    max(0, min(self.feature_bins - 1, c + random.randint(-2, 2)))
+                    max(0, min(self.feature_bins - 1, c + self.rng.randint(-2, 2)))
                     for c in feature_coords
                 ]
 
@@ -1320,7 +1320,7 @@ class ProgramDatabase:
                 ]
 
                 if available_island_ids:
-                    random_ids = random.sample(
+                    random_ids = self.rng.sample(
                         available_island_ids, min(remaining, len(available_island_ids))
                     )
                     random_programs = [self.programs[pid] for pid in random_ids]
@@ -1826,7 +1826,7 @@ class ProgramDatabase:
             remaining = all_programs.copy()
 
             # Start with a random program
-            first_idx = random.randint(0, len(remaining) - 1)
+            first_idx = self.rng.randint(0, len(remaining) - 1)
             selected.append(remaining.pop(first_idx))
 
             # Greedily add programs that maximize diversity to selected set
