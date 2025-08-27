@@ -275,6 +275,28 @@ class ProgramDatabase:
                     f"Failed to generate diff for commit {program.commit_hash}: {e}"
                 )
 
+        # Fallback exact deduplication (should rarely trigger because pre-eval dedup runs earlier)
+        try:
+            is_empty_island_clone = bool(program.metadata.get("cloned_for_empty_island"))
+        except Exception:
+            is_empty_island_clone = False
+
+        if not is_empty_island_clone:
+            key = self._equivalence_key(program)
+            if key and key in self.seen_equiv_keys:
+                # Remove temporary insertion and skip heavy bookkeeping
+                if program.id in self.programs:
+                    try:
+                        del self.programs[program.id]
+                    except Exception:
+                        self.programs.pop(program.id, None)
+                existing_id = self.key_to_program_id.get(key)
+                logger.warning(
+                    f"Exact duplicate detected in add(): {program.id} duplicates existing {existing_id or 'program with same key'}; skipping insertion"
+                )
+                # Return canonical existing program id if known
+                return existing_id or program.id
+
         # Calculate feature coordinates for MAP-Elites
         feature_coords = self._calculate_feature_coords(program)
 
