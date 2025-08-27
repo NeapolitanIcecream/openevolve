@@ -1324,14 +1324,18 @@ class ProgramDatabase:
             feature_coords = self._calculate_feature_coords(parent)
             nearby_programs = []
 
-            # Create a mapping of feature cells to island programs for efficient lookup
+            # Create a mapping of feature cells to island programs for efficient lookup (cell -> list of program ids)
             island_feature_map = {}
             for prog_id in island_program_ids:
                 if prog_id in self.programs:
                     prog = self.programs[prog_id]
                     prog_coords = self._calculate_feature_coords(prog)
                     cell_key = self._feature_coords_to_key(prog_coords)
-                    island_feature_map[cell_key] = prog_id
+                    bucket = island_feature_map.get(cell_key)
+                    if bucket is None:
+                        island_feature_map[cell_key] = [prog_id]
+                    else:
+                        bucket.append(prog_id)
 
             # Try to find programs from nearby feature cells within the island
             for _ in range(remaining_slots * 3):  # Try more times to find nearby programs
@@ -1345,14 +1349,18 @@ class ProgramDatabase:
 
                 cell_key = self._feature_coords_to_key(perturbed_coords)
                 if cell_key in island_feature_map:
-                    program_id = island_feature_map[cell_key]
-                    if (
-                        program_id != parent.id
-                        and program_id not in [p.id for p in inspirations]
-                        and program_id not in [p.id for p in nearby_programs]
-                        and program_id in self.programs
-                    ):
-                        nearby_programs.append(self.programs[program_id])
+                    candidate_ids = [
+                        pid for pid in island_feature_map[cell_key]
+                        if (
+                            pid != parent.id
+                            and pid not in [p.id for p in inspirations]
+                            and pid not in [p.id for p in nearby_programs]
+                            and pid in self.programs
+                        )
+                    ]
+                    if candidate_ids:
+                        chosen_id = self.rng.choice(candidate_ids)
+                        nearby_programs.append(self.programs[chosen_id])
                         if len(nearby_programs) >= remaining_slots:
                             break
 
