@@ -177,8 +177,8 @@ class ProgramDatabase:
         else:
             self.rng = random.Random()
 
-        # Diversity caching infrastructure
-        self.diversity_cache: Dict[int, DiversityCacheEntry] = {}
+        # Diversity caching infrastructure (use stable string key)
+        self.diversity_cache: Dict[str, DiversityCacheEntry] = {}
         self.diversity_cache_size: int = getattr(config, "diversity_cache_size", 1000)
         self.diversity_reference_set: List[List[int]] = []  # Reference signatures
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
@@ -305,16 +305,23 @@ class ProgramDatabase:
             if feature_key not in self.feature_map:
                 # New cell occupation
                 logger.info("New MAP-Elites cell occupied: %s", coords_dict)
-                # Check coverage milestone
-                total_possible_cells = self.feature_bins ** len(self.config.feature_dimensions)
-                coverage = (len(self.feature_map) + 1) / total_possible_cells
-                if coverage in [0.1, 0.25, 0.5, 0.75, 0.9]:
-                    logger.info(
-                        "MAP-Elites coverage reached %.1f%% (%d/%d cells)",
-                        coverage * 100,
-                        len(self.feature_map) + 1,
-                        total_possible_cells,
-                    )
+                # Check coverage milestone using per-dimension bins and integer thresholds
+                total_possible_cells = 1
+                for dim in self.config.feature_dimensions:
+                    total_possible_cells *= int(self.feature_bins_per_dim.get(dim, self.feature_bins))
+                prev_occupied = len(self.feature_map)
+                new_occupied = prev_occupied + 1
+                milestones = [0.1, 0.25, 0.5, 0.75, 0.9]
+                for m in milestones:
+                    target_cells = max(1, int(math.ceil(total_possible_cells * m)))
+                    if prev_occupied < target_cells <= new_occupied:
+                        coverage = new_occupied / total_possible_cells
+                        logger.info(
+                            "MAP-Elites coverage reached %.1f%% (%d/%d cells)",
+                            coverage * 100,
+                            new_occupied,
+                            total_possible_cells,
+                        )
             else:
                 # Cell replacement - existing program being replaced
                 existing_program_id = self.feature_map[feature_key]
@@ -343,6 +350,18 @@ class ProgramDatabase:
 
         # Track which island this program belongs to
         program.metadata["island"] = island_idx
+
+        # Write derived fields for observability
+        if program.hash_diff:
+            program.complexity = float(len(program.hash_diff))
+        elif program.prompt_diff:
+            program.complexity = float(len(program.prompt_diff))
+        else:
+            program.complexity = 0.0
+        try:
+            program.diversity = float(self._get_cached_diversity(program))
+        except Exception:
+            program.diversity = 0.0
 
         # Update archive
         self._update_archive(program)
@@ -558,6 +577,8 @@ class ProgramDatabase:
             self._save_program(program, save_path)
 
         # Save metadata
+        # Always persist seen_equiv_keys when an explicit save path is provided (e.g., snapshot)
+        persist_seen_keys = True if path is not None else self.persistence_enabled
         metadata = {
             "feature_map": self.feature_map,
             "islands": [list(island) for island in self.islands],
@@ -568,8 +589,8 @@ class ProgramDatabase:
             "current_island": self.current_island,
             "island_generations": self.island_generations,
             "last_migration_generation": self.last_migration_generation,
-            # Persist dedup keys only when persistence is enabled
-            "seen_equiv_keys": list(self.seen_equiv_keys) if self.persistence_enabled else [],
+            # Persist dedup keys
+            "seen_equiv_keys": list(self.seen_equiv_keys) if persist_seen_keys else [],
         }
 
         with open(os.path.join(save_path, "metadata.json"), "w") as f:
@@ -607,13 +628,12 @@ class ProgramDatabase:
             self.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
             self.last_migration_generation = metadata.get("last_migration_generation", 0)
             # Restore dedup keys (guarded by persistence flag)
-            if self.persistence_enabled:
-                try:
-                    keys = metadata.get("seen_equiv_keys", [])
-                    if isinstance(keys, list):
-                        self.seen_equiv_keys = set(str(k) for k in keys)
-                except Exception as e:
-                    logger.warning(f"Failed to restore seen_equiv_keys: {e}")
+            try:
+                keys = metadata.get("seen_equiv_keys", [])
+                if isinstance(keys, list):
+                    self.seen_equiv_keys = set(str(k) for k in keys)
+            except Exception as e:
+                logger.warning(f"Failed to restore seen_equiv_keys: {e}")
 
             logger.info(f"Loaded database metadata with last_iteration={self.last_iteration}")
 
@@ -1099,17 +1119,31 @@ class ProgramDatabase:
         current_island_programs = self.islands[self.current_island]
 
         if not current_island_programs:
-            # If current island is empty, initialize with best program or random program
+            # If current island is empty, initialize with a cloned program (avoid multi-island assignment)
+            source_prog: Optional[Program] = None
             if self.best_program_id and self.best_program_id in self.programs:
-                # Clone best program to current island
-                best_program = self.programs[self.best_program_id]
-                self.islands[self.current_island].add(self.best_program_id)
-                best_program.metadata["island"] = self.current_island
-                logger.debug(f"Initialized empty island {self.current_island} with best program")
-                return best_program
+                source_prog = self.programs[self.best_program_id]
             else:
-                # Use any available program
-                return next(iter(self.programs.values()))
+                try:
+                    source_prog = next(iter(self.programs.values()))
+                except StopIteration:
+                    raise ValueError("No programs available to initialize empty island")
+
+            migrant_copy = Program(
+                id=self._generate_migrant_id(source_prog.id, self.current_island),
+                commit_hash=source_prog.commit_hash,
+                prompt_diff=source_prog.prompt_diff,
+                hash_diff=source_prog.hash_diff,
+                minhash_signature=source_prog.minhash_signature.copy(),
+                language=source_prog.language,
+                parent_id=source_prog.id,
+                generation=source_prog.generation,
+                metrics=source_prog.metrics.copy(),
+                metadata={**source_prog.metadata, "migrant": True, "cloned_for_empty_island": True, "source_island": cast(Optional[int], source_prog.metadata.get("island")), "source_program_id": source_prog.id},
+            )
+            new_id = self.add(migrant_copy, target_island=self.current_island)
+            logger.debug(f"Initialized empty island {self.current_island} with cloned program {new_id}")
+            return self.programs[new_id]
 
         # Clean up stale references and sample from current island
         valid_programs = [pid for pid in current_island_programs if pid in self.programs]
@@ -1128,13 +1162,30 @@ class ProgramDatabase:
             logger.warning(
                 f"Island {self.current_island} has no valid programs after cleanup, reinitializing"
             )
+            reinit_source_prog: Optional[Program] = None
             if self.best_program_id and self.best_program_id in self.programs:
-                best_program = self.programs[self.best_program_id]
-                self.islands[self.current_island].add(self.best_program_id)
-                best_program.metadata["island"] = self.current_island
-                return best_program
+                reinit_source_prog = self.programs[self.best_program_id]
             else:
-                return next(iter(self.programs.values()))
+                try:
+                    reinit_source_prog = next(iter(self.programs.values()))
+                except StopIteration:
+                    raise ValueError("No programs available to reinitialize island")
+
+            migrant_copy = Program(
+                id=self._generate_migrant_id(reinit_source_prog.id, self.current_island),
+                commit_hash=reinit_source_prog.commit_hash,
+                prompt_diff=reinit_source_prog.prompt_diff,
+                hash_diff=reinit_source_prog.hash_diff,
+                minhash_signature=reinit_source_prog.minhash_signature.copy(),
+                language=reinit_source_prog.language,
+                parent_id=reinit_source_prog.id,
+                generation=reinit_source_prog.generation,
+                metrics=reinit_source_prog.metrics.copy(),
+                metadata={**reinit_source_prog.metadata, "migrant": True, "cloned_for_empty_island": True, "source_island": cast(Optional[int], reinit_source_prog.metadata.get("island")), "source_program_id": reinit_source_prog.id},
+            )
+            new_id = self.add(migrant_copy, target_island=self.current_island)
+            logger.debug(f"Reinitialized island {self.current_island} with cloned program {new_id}")
+            return self.programs[new_id]
 
         # Sample from valid programs
         parent_id = self.rng.choice(valid_programs)
@@ -1284,11 +1335,13 @@ class ProgramDatabase:
 
             # Try to find programs from nearby feature cells within the island
             for _ in range(remaining_slots * 3):  # Try more times to find nearby programs
-                # Perturb coordinates
-                perturbed_coords = [
-                    max(0, min(self.feature_bins - 1, c + self.rng.randint(-2, 2)))
-                    for c in feature_coords
-                ]
+                # Perturb coordinates (respect per-dimension bins)
+                perturbed_coords = []
+                for idx, c in enumerate(feature_coords):
+                    dim = self.config.feature_dimensions[idx] if idx < len(self.config.feature_dimensions) else None
+                    num_bins = int(self.feature_bins_per_dim.get(dim, self.feature_bins)) if dim is not None else int(self.feature_bins)
+                    perturbed_val = c + self.rng.randint(-2, 2)
+                    perturbed_coords.append(max(0, min(max(0, num_bins - 1), perturbed_val)))
 
                 cell_key = self._feature_coords_to_key(perturbed_coords)
                 if cell_key in island_feature_map:
@@ -1765,11 +1818,15 @@ class ProgramDatabase:
         Returns:
             Diversity score (cached or newly computed)
         """
-        code_hash = hash(program.hash_diff or program.prompt_diff or "")
+        text_for_key = program.hash_diff or program.prompt_diff or ""
+        try:
+            code_key = hashlib.sha1(text_for_key.encode("utf-8")).hexdigest()
+        except Exception:
+            code_key = ""
 
         # Check cache first
-        if code_hash in self.diversity_cache:
-            return self.diversity_cache[code_hash]["value"]
+        if code_key in self.diversity_cache:
+            return self.diversity_cache[code_key]["value"]
 
         # Ensure program has MinHash signature
         if not program.minhash_signature and (program.hash_diff or program.prompt_diff):
@@ -1797,7 +1854,7 @@ class ProgramDatabase:
         )
 
         # Cache the result with LRU eviction
-        self._cache_diversity_value(code_hash, diversity)
+        self._cache_diversity_value(code_key, diversity)
 
         return diversity
 
@@ -1865,16 +1922,16 @@ class ProgramDatabase:
             f"Updated diversity reference set with {len(self.diversity_reference_set)} programs"
         )
 
-    def _cache_diversity_value(self, code_hash: int, diversity: float) -> None:
-        """Cache a diversity value with LRU eviction"""
+    def _cache_diversity_value(self, code_key: str, diversity: float) -> None:
+        """Cache a diversity value with LRU eviction (string key)"""
         # Check if cache is full
         if len(self.diversity_cache) >= self.diversity_cache_size:
             # Remove oldest entry
-            oldest_hash = min(self.diversity_cache.items(), key=lambda x: x[1]["timestamp"])[0]
-            del self.diversity_cache[oldest_hash]
+            oldest_key = min(self.diversity_cache.items(), key=lambda x: x[1]["timestamp"])[0]
+            del self.diversity_cache[oldest_key]
 
         # Add new entry
-        self.diversity_cache[code_hash] = {"value": diversity, "timestamp": time.time()}
+        self.diversity_cache[code_key] = {"value": diversity, "timestamp": time.time()}
 
     def _invalidate_diversity_cache(self) -> None:
         """Invalidate the diversity cache when programs change significantly"""
