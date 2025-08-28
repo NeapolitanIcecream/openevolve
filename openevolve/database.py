@@ -197,6 +197,10 @@ class ProgramDatabase:
         self.feature_stats_min_samples: int = int(
             getattr(config, "feature_stats_min_samples", 50)
         )
+        # Rebuild trigger on removals (fraction of population removed in a single operation)
+        self.feature_stats_rebuild_remove_ratio: float = float(
+            getattr(config, "feature_stats_rebuild_remove_ratio", 0.1)
+        )
         # Robust scaling quantiles (inclusive lower, upper)
         self.feature_stats_robust_low_q: float = float(
             getattr(config, "feature_stats_robust_low_q", 0.05)
@@ -297,8 +301,8 @@ class ProgramDatabase:
                 # Return canonical existing program id if known
                 return existing_id or program.id
 
-        # Calculate feature coordinates for MAP-Elites
-        feature_coords = self._calculate_feature_coords(program)
+        # Calculate feature coordinates for MAP-Elites (write path should update stats)
+        feature_coords = self._calculate_feature_coords(program, update_stats=True)
 
         # Add to feature map (replacing existing if better)
         feature_key = self._feature_coords_to_key(feature_coords)
@@ -694,6 +698,13 @@ class ProgramDatabase:
         if not self.seen_equiv_keys and self.programs:
             self._rebuild_seen_keys_from_programs()
 
+        # Rebuild feature stats from current programs to avoid read-path pollution after load
+        if self.programs:
+            try:
+                self._rebuild_feature_stats_from_programs()
+            except Exception as e:
+                logger.warning(f"Failed to rebuild feature stats after load: {e}")
+
     def _reconstruct_islands(self, saved_islands: List[List[str]]) -> None:
         """
         Reconstruct island assignments from saved metadata
@@ -811,12 +822,15 @@ class ProgramDatabase:
         with open(program_path, "w") as f:
             json.dump(program_dict, f)
 
-    def _calculate_feature_coords(self, program: Program) -> List[int]:
+    def _calculate_feature_coords(self, program: Program, update_stats: bool = False) -> List[int]:
         """
         Calculate feature coordinates for the MAP-Elites grid
 
         Args:
             program: Program to calculate features for
+            update_stats: When True, update sliding-window feature statistics while scaling.
+                Use True for write-path operations (e.g., add). Use False for read-path
+                operations (e.g., sampling, logging) to avoid read-path pollution.
 
         Returns:
             List of feature coordinates
@@ -832,7 +846,7 @@ class ProgramDatabase:
                     complexity = len(program.prompt_diff)
                 else:
                     complexity = 0
-                bin_idx = self._calculate_complexity_bin(complexity)
+                bin_idx = self._calculate_complexity_bin(complexity, update_stats=update_stats)
                 coords.append(bin_idx)
             elif dim == "diversity":
                 # Use cached diversity calculation with reference set
@@ -840,7 +854,7 @@ class ProgramDatabase:
                     bin_idx = 0
                 else:
                     diversity = self._get_cached_diversity(program)
-                    bin_idx = self._calculate_diversity_bin(diversity)
+                    bin_idx = self._calculate_diversity_bin(diversity, update_stats=update_stats)
                 coords.append(bin_idx)
             elif dim == "score":
                 # Use average of numeric metrics
@@ -849,7 +863,8 @@ class ProgramDatabase:
                 else:
                     avg_score = safe_numeric_average(program.metrics)
                     # Update stats and scale
-                    self._update_feature_stats("score", avg_score)
+                    if update_stats:
+                        self._update_feature_stats("score", avg_score)
                     scaled_value = self._scale_feature_value("score", avg_score)
                     num_bins = self.feature_bins_per_dim.get("score", self.feature_bins)
                     bin_idx = int(scaled_value * num_bins)
@@ -859,7 +874,8 @@ class ProgramDatabase:
                 # Use specific metric
                 score = program.metrics[dim]
                 # Update stats and scale
-                self._update_feature_stats(dim, score)
+                if update_stats:
+                    self._update_feature_stats(dim, score)
                 scaled_value = self._scale_feature_value(dim, score)
                 num_bins = self.feature_bins_per_dim.get(dim, self.feature_bins)
                 bin_idx = int(scaled_value * num_bins)
@@ -879,18 +895,20 @@ class ProgramDatabase:
         )
         return coords
 
-    def _calculate_complexity_bin(self, complexity: int) -> int:
+    def _calculate_complexity_bin(self, complexity: int, update_stats: bool = False) -> int:
         """
         Calculate the bin index for a given complexity value using feature scaling.
 
         Args:
             complexity: The complexity value (change lines)
+            update_stats: When True, push value into sliding-window stats prior to scaling.
 
         Returns:
             Bin index in range [0, self.feature_bins - 1]
         """
-        # Update feature statistics
-        self._update_feature_stats("complexity", float(complexity))
+        # Update feature statistics (only when requested by write path)
+        if update_stats:
+            self._update_feature_stats("complexity", float(complexity))
 
         # Scale the value using configured method
         scaled_value = self._scale_feature_value("complexity", float(complexity))
@@ -906,18 +924,20 @@ class ProgramDatabase:
 
         return bin_idx
 
-    def _calculate_diversity_bin(self, diversity: float) -> int:
+    def _calculate_diversity_bin(self, diversity: float, update_stats: bool = False) -> int:
         """
         Calculate the bin index for a given diversity value using feature scaling.
 
         Args:
             diversity: The average fast code diversity to other programs
+            update_stats: When True, push value into sliding-window stats prior to scaling.
 
         Returns:
             Bin index in range [0, self.feature_bins - 1]
         """
-        # Update feature statistics
-        self._update_feature_stats("diversity", diversity)
+        # Update feature statistics (only when requested by write path)
+        if update_stats:
+            self._update_feature_stats("diversity", diversity)
 
         # Scale the value using configured method
         scaled_value = self._scale_feature_value("diversity", diversity)
@@ -1342,8 +1362,8 @@ class ProgramDatabase:
         if len(island_programs) > n and len(inspirations) < n:
             remaining_slots = n - len(inspirations)
 
-            # Try to sample from different feature cells within the island
-            feature_coords = self._calculate_feature_coords(parent)
+            # Try to sample from different feature cells within the island (read-only coords)
+            feature_coords = self._calculate_feature_coords(parent, update_stats=False)
             nearby_programs = []
 
             # Create a mapping of feature cells to island programs for efficient lookup (cell -> list of program ids)
@@ -1351,7 +1371,7 @@ class ProgramDatabase:
             for prog_id in island_program_ids:
                 if prog_id in self.programs:
                     prog = self.programs[prog_id]
-                    prog_coords = self._calculate_feature_coords(prog)
+                    prog_coords = self._calculate_feature_coords(prog, update_stats=False)
                     cell_key = self._feature_coords_to_key(prog_coords)
                     bucket = island_feature_map.get(cell_key)
                     if bucket is None:
@@ -1468,6 +1488,7 @@ class ProgramDatabase:
             programs_to_remove.extend(additional_removals)
 
         # Remove the selected programs
+        removed_count = 0
         for program in programs_to_remove:
             program_id = program.id
 
@@ -1490,12 +1511,23 @@ class ProgramDatabase:
             # Remove from archive
             self.archive.discard(program_id)
 
+            removed_count += 1
             logger.debug(f"Removed program {program_id} due to population limit")
 
         logger.info(f"Population size after cleanup: {len(self.programs)}")
 
         # Clean up any stale island best program references after removal
         self._cleanup_stale_island_bests()
+
+        # If a large fraction of population was removed in one operation, rebuild stats
+        try:
+            original_size = len(all_programs)
+            if original_size > 0:
+                removed_ratio = removed_count / float(original_size)
+                if removed_ratio >= self.feature_stats_rebuild_remove_ratio:
+                    self._rebuild_feature_stats_from_programs()
+        except Exception as e:
+            logger.debug(f"Feature stats rebuild check failed: {e}")
 
     # Island management methods
     def set_current_island(self, island_idx: int) -> None:
@@ -1608,7 +1640,7 @@ class ProgramDatabase:
                     selected += 1
 
                     # Optional: log MAP-Elites coordinates post-registration
-                    feature_coords = self._calculate_feature_coords(migrant_copy)
+                    feature_coords = self._calculate_feature_coords(migrant_copy, update_stats=False)
                     coords_dict = {
                         self.config.feature_dimensions[j]: feature_coords[j]
                         for j in range(len(feature_coords))
@@ -1952,6 +1984,75 @@ class ProgramDatabase:
             f"Updated diversity reference set with {len(self.diversity_reference_set)} programs"
         )
 
+    def _rebuild_feature_stats_from_programs(self) -> None:
+        """Rebuild feature stats buffers and cache from current programs (read-only scan).
+
+        This avoids read-path pollution by recreating statistics using the current
+        program set, without incrementally appending via read calls.
+        """
+        # Reset buffers and counters
+        self.feature_stats.clear()
+        self._feature_value_buffer.clear()
+        self._feature_updates_since_recompute.clear()
+        self._feature_stats_cache.clear()
+
+        if not self.programs:
+            return
+
+        # Helper to push a value into buffers (without triggering recompute yet)
+        def _append(feature_name: str, v: float) -> None:
+            stats = self.feature_stats.get(feature_name)
+            if stats is None:
+                self.feature_stats[feature_name] = {"min": v, "max": v}
+            else:
+                stats["min"] = min(stats["min"], v)
+                stats["max"] = max(stats["max"], v)
+            buf = self._feature_value_buffer.get(feature_name)
+            if buf is None:
+                buf = deque(maxlen=self.feature_stats_window_size)
+                self._feature_value_buffer[feature_name] = buf
+            buf.append(float(v))
+
+        # Populate buffers from existing programs
+        for prog in self.programs.values():
+            # complexity
+            if prog.hash_diff:
+                comp = float(len(prog.hash_diff))
+            elif prog.prompt_diff:
+                comp = float(len(prog.prompt_diff))
+            else:
+                comp = 0.0
+            _append("complexity", comp)
+
+            # diversity (use stored value if present, otherwise estimate lazily)
+            try:
+                div = float(prog.diversity) if isinstance(prog.diversity, (int, float)) else 0.0
+            except Exception:
+                div = 0.0
+            _append("diversity", div)
+
+            # aggregated score
+            if prog.metrics:
+                avg_score = safe_numeric_average(prog.metrics)
+                _append("score", float(avg_score))
+
+            # each specific metric used by feature_dimensions
+            for dim in self.config.feature_dimensions:
+                if dim not in ("complexity", "diversity", "score") and dim in prog.metrics:
+                    try:
+                        _append(dim, float(prog.metrics[dim]))
+                    except Exception:
+                        pass
+
+        # Recompute cached statistics for all features we filled
+        for feature_name in list(self._feature_value_buffer.keys()):
+            try:
+                self._recompute_feature_stats(feature_name)
+                # mark zero updates since recompute
+                self._feature_updates_since_recompute[feature_name] = 0
+            except Exception:
+                continue
+
     def _cache_diversity_value(self, code_key: str, diversity: float) -> None:
         """Cache a diversity value with LRU eviction (string key)"""
         # Check if cache is full
@@ -2016,13 +2117,42 @@ class ProgramDatabase:
         # Prefer cached window stats when available
         cache = self._feature_stats_cache.get(feature_name, {})
 
+        # Helper: readonly fallback strategy when cache is missing
+        def _readonly_fallback() -> float:
+            mode = getattr(self.config, "feature_readonly_fallback_mode", "use_feature_stats")
+            if mode == "neutral_0_5":
+                return 0.5
+            if mode == "clip_0_1":
+                return min(1.0, max(0.0, float(value)))
+            if mode == "static_ranges":
+                try:
+                    static_ranges = getattr(self.config, "feature_readonly_static_minmax", {})
+                    if feature_name in static_ranges and isinstance(static_ranges[feature_name], (list, tuple)) and len(static_ranges[feature_name]) == 2:
+                        min_v, max_v = float(static_ranges[feature_name][0]), float(static_ranges[feature_name][1])
+                        if max_v <= min_v:
+                            return 0.5
+                        return min(1.0, max(0.0, (float(value) - min_v) / (max_v - min_v)))
+                except Exception:
+                    pass
+                # fallback to neutral if static range invalid
+                return 0.5
+            # use_feature_stats (default): try legacy stats; if still missing, final fallback is clip
+            stats = self.feature_stats.get(feature_name)
+            if stats is not None:
+                min_v = stats.get("min")
+                max_v = stats.get("max")
+                if min_v is not None and max_v is not None and max_v != min_v:
+                    return min(1.0, max(0.0, (float(value) - float(min_v)) / (float(max_v) - float(min_v))))
+            # last resort
+            return min(1.0, max(0.0, float(value)))
+
         # Robust scaling (recommended default)
         if method == "robust":
             q_low = cache.get("q_low")
             q_high = cache.get("q_high")
             if q_low is None or q_high is None:
-                # Not enough stats yet; fall back to minmax
-                return self._scale_feature_value_minmax(feature_name, value)
+                # Not enough stats yet; readonly fallback
+                return _readonly_fallback()
             if q_high <= q_low:
                 return 0.5
             scaled = (float(value) - q_low) / (q_high - q_low)
@@ -2034,12 +2164,8 @@ class ProgramDatabase:
             min_val = cache.get("min")
             max_val = cache.get("max")
             if min_val is None or max_val is None:
-                # Legacy stats fallback
-                if feature_name not in self.feature_stats:
-                    return min(1.0, max(0.0, float(value)))
-                stats = self.feature_stats[feature_name]
-                min_val = stats["min"]
-                max_val = stats["max"]
+                # Readonly fallback
+                return _readonly_fallback()
             if max_val == min_val:
                 return 0.5
             scaled = (float(value) - float(min_val)) / (float(max_val) - float(min_val))
@@ -2049,7 +2175,7 @@ class ProgramDatabase:
         if method == "percentile":
             values = list(self._feature_value_buffer.get(feature_name, []))
             if not values:
-                return 0.5
+                return _readonly_fallback()
             # Linear scan rank (W is small, default 5000)
             count = sum(1 for v in values if v <= float(value))
             return count / len(values)
@@ -2059,13 +2185,13 @@ class ProgramDatabase:
             mean = cache.get("mean")
             std = cache.get("std")
             if mean is None or std is None or std == 0:
-                return 0.5
+                return _readonly_fallback()
             z = (float(value) - mean) / std
             # Map via standard normal CDF approximation using erf
             return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-        # Unknown method -> fallback to minmax
-        return self._scale_feature_value_minmax(feature_name, value)
+        # Unknown method -> readonly fallback
+        return _readonly_fallback()
 
     def _scale_feature_value_minmax(self, feature_name: str, value: float) -> float:
         """Helper for min-max scaling"""

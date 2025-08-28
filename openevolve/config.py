@@ -220,6 +220,13 @@ class DatabaseConfig:
     feature_stats_robust_low_q: float = 0.05
     feature_stats_robust_high_q: float = 0.95
     feature_scaling_method_per_dim: Dict[str, str] = field(default_factory=dict)
+    # Readonly fallback when cache/stats are missing in read-path scaling
+    # Options: "use_feature_stats" (default), "neutral_0_5", "clip_0_1", "static_ranges"
+    feature_readonly_fallback_mode: str = "use_feature_stats"
+    # For static_ranges mode: per-dimension [min, max]
+    feature_readonly_static_minmax: Dict[str, List[float]] = field(default_factory=dict)
+    # Trigger a rebuild of feature stats when a single cleanup removes ≥ this fraction of population
+    feature_stats_rebuild_remove_ratio: float = 0.1
 
     # MinHash signature settings
     minhash_num_perm: int = 64
@@ -425,6 +432,9 @@ class Config:
                 "feature_stats_robust_low_q": self.database.feature_stats_robust_low_q,
                 "feature_stats_robust_high_q": self.database.feature_stats_robust_high_q,
                 "feature_scaling_method_per_dim": self.database.feature_scaling_method_per_dim,
+                "feature_readonly_fallback_mode": self.database.feature_readonly_fallback_mode,
+                "feature_readonly_static_minmax": self.database.feature_readonly_static_minmax,
+                "feature_stats_rebuild_remove_ratio": self.database.feature_stats_rebuild_remove_ratio,
                 "minhash_num_perm": self.database.minhash_num_perm,
                 "minhash_shingle_len": self.database.minhash_shingle_len,
                 "commit_message_template": self.database.commit_message_template,
