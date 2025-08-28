@@ -304,7 +304,26 @@ class ProgramDatabase:
                     f"Exact duplicate detected in add(): {program.id} duplicates existing {existing_id or 'program with same key'}; skipping insertion"
                 )
                 # Return canonical existing program id if known
-                return existing_id or program.id
+                if existing_id:
+                    return existing_id
+                # Fallback: scan to find canonical id and update mapping
+                try:
+                    canonical_id = None
+                    for _prog in self.programs.values():
+                        try:
+                            _k = self._equivalence_key(_prog)
+                        except Exception:
+                            _k = None
+                        if _k == key:
+                            canonical_id = _prog.id
+                            break
+                    if canonical_id:
+                        self.key_to_program_id[key] = canonical_id
+                        return canonical_id
+                except Exception:
+                    pass
+                # As a last resort, return the original id
+                return program.id
 
         # Calculate feature coordinates for MAP-Elites (write path should update stats)
         feature_coords = self._calculate_feature_coords(program, update_stats=True)
@@ -506,27 +525,6 @@ class ProgramDatabase:
             if sorted_programs:
                 logger.debug(f"Found best program by average metrics: {sorted_programs[0].id}")
 
-        # Update the best program tracking if we found a better program
-        if sorted_programs and (
-            self.best_program_id is None or sorted_programs[0].id != self.best_program_id
-        ):
-            old_id = self.best_program_id
-            self.best_program_id = sorted_programs[0].id
-            logger.info(f"Updated best program tracking from {old_id} to {self.best_program_id}")
-
-            # Also log the scores to help understand the update
-            if (
-                old_id
-                and old_id in self.programs
-                and "combined_score" in self.programs[old_id].metrics
-                and "combined_score" in self.programs[self.best_program_id].metrics
-            ):
-                old_score = self.programs[old_id].metrics["combined_score"]
-                new_score = self.programs[self.best_program_id].metrics["combined_score"]
-                logger.info(
-                    f"Score change: {old_score:.4f} → {new_score:.4f} ({new_score-old_score:+.4f})"
-                )
-
         return sorted_programs[0] if sorted_programs else None
 
     def get_top_programs(
@@ -711,12 +709,79 @@ class ProgramDatabase:
         if not self.seen_equiv_keys and self.programs:
             self._rebuild_seen_keys_from_programs()
 
+        # Repair and rebuild runtime indexes derived from programs to avoid orphan/index loss
+        try:
+            # 1) Ensure all programs have an island: if any island is empty or programs unassigned, distribute
+            total_assigned = sum(len(island) for island in self.islands)
+            if total_assigned < len(self.programs):
+                # Some programs are not assigned; assign them round-robin and set metadata
+                missing_ids = [
+                    pid for pid in self.programs.keys()
+                    if all(pid not in island for island in self.islands)
+                ]
+                if missing_ids:
+                    for idx, pid in enumerate(missing_ids):
+                        island_idx = idx % len(self.islands)
+                        self.islands[island_idx].add(pid)
+                        try:
+                            self.programs[pid].metadata["island"] = island_idx
+                        except Exception:
+                            pass
+
+            # 2) Rebuild feature_map from scratch using current programs and _is_better()
+            rebuilt_feature_map: Dict[str, str] = {}
+            for prog in self.programs.values():
+                try:
+                    coords = self._calculate_feature_coords(prog, update_stats=False)
+                except Exception:
+                    continue
+                key = self._feature_coords_to_key(coords)
+                if key not in rebuilt_feature_map:
+                    rebuilt_feature_map[key] = prog.id
+                else:
+                    existing_id = rebuilt_feature_map[key]
+                    if existing_id in self.programs:
+                        if self._is_better(prog, self.programs[existing_id]):
+                            rebuilt_feature_map[key] = prog.id
+                    else:
+                        rebuilt_feature_map[key] = prog.id
+            self.feature_map = rebuilt_feature_map
+
+            # 3) Recalculate island best programs coherently using _is_better()
+            new_island_bests: List[Optional[str]] = [None] * len(self.islands)
+            for i, island in enumerate(self.islands):
+                best_id: Optional[str] = None
+                for pid in island:
+                    if pid not in self.programs:
+                        continue
+                    if best_id is None:
+                        best_id = pid
+                    else:
+                        if self._is_better(self.programs[pid], self.programs[best_id]):
+                            best_id = pid
+                new_island_bests[i] = best_id
+            self.island_best_programs = new_island_bests
+        except Exception as e:
+            logger.warning(f"Post-load repair/rebuild encountered an error: {e}")
+
+        # Always rebuild key->program id map after load to ensure dedup consistency
+        try:
+            self._rebuild_key_to_program_id_map()
+        except Exception as e:
+            logger.warning(f"Failed to rebuild key_to_program_id map: {e}")
+
         # Rebuild feature stats from current programs to avoid read-path pollution after load
         if self.programs:
             try:
                 self._rebuild_feature_stats_from_programs()
             except Exception as e:
                 logger.warning(f"Failed to rebuild feature stats after load: {e}")
+
+        # Normalize MinHash signatures to current configuration after load
+        try:
+            self._normalize_minhash_signatures_on_load()
+        except Exception as e:
+            logger.debug(f"Failed to normalize MinHash signatures after load: {e}")
 
         # Rebuild diversity reference set after load to ensure freshness
         try:
@@ -1047,13 +1112,19 @@ class ProgramDatabase:
             self.archive.add(program.id)
             return
 
-        # Find worst program among valid programs
+        # Find worst program among valid programs using the same criterion as _is_better
         if valid_archive_programs:
-            worst_program = min(
-                valid_archive_programs, key=lambda p: safe_numeric_average(p.metrics)
-            )
+            worst_program = valid_archive_programs[0]
+            for p in valid_archive_programs[1:]:
+                # If p is better than current worst, keep worst; otherwise update worst to p
+                # i.e., choose the one that is NOT better than many others
+                if self._is_better(worst_program, p):
+                    # worst_program remains
+                    pass
+                else:
+                    worst_program = p
 
-            # Replace if new program is better
+            # Replace if new program is better than the worst in archive
             if self._is_better(program, worst_program):
                 self.archive.remove(worst_program.id)
                 self.archive.add(program.id)
@@ -1739,6 +1810,17 @@ class ProgramDatabase:
         except Exception:
             return None
 
+    def _find_program_id_by_equivalence_key(self, key: str) -> Optional[str]:
+        """Find the first program id with the given equivalence key via linear scan."""
+        for prog in self.programs.values():
+            try:
+                k = self._equivalence_key(prog)
+            except Exception:
+                k = None
+            if k == key:
+                return prog.id
+        return None
+
     def is_duplicate(self, program: Program) -> bool:
         """Check if a program is an exact duplicate based on equivalence key."""
         key = self._equivalence_key(program)
@@ -1765,6 +1847,14 @@ class ProgramDatabase:
                 rebuilt += 1
         if rebuilt:
             logger.info(f"Rebuilt {rebuilt} dedup keys from programs on load")
+
+    def _rebuild_key_to_program_id_map(self) -> None:
+        """Rebuild mapping from equivalence key to the first program id (post-load)."""
+        self.key_to_program_id.clear()
+        for prog in self.programs.values():
+            key = self._equivalence_key(prog)
+            if key and key not in self.key_to_program_id:
+                self.key_to_program_id[key] = prog.id
 
     def _cleanup_stale_island_bests(self) -> None:
         """
@@ -1951,6 +2041,46 @@ class ProgramDatabase:
         self._cache_diversity_value(code_key, diversity)
 
         return diversity
+
+    def _normalize_minhash_signatures_on_load(self) -> None:
+        """Normalize all programs' MinHash signatures to current configuration after load.
+
+        Recompute signatures that do not match the configured num_perm; clear if no diff text.
+        """
+        try:
+            target_num_perm = int(getattr(self.config, "minhash_num_perm", 64))
+            shingle_len = int(getattr(self.config, "minhash_shingle_len", 5))
+        except Exception:
+            target_num_perm = 64
+            shingle_len = 5
+        updated = 0
+        for prog in self.programs.values():
+            sig = prog.minhash_signature
+            need_rebuild = False
+            try:
+                if not isinstance(sig, list) or len(sig) != target_num_perm:
+                    need_rebuild = True
+            except Exception:
+                need_rebuild = True
+            if need_rebuild:
+                text = prog.hash_diff or prog.prompt_diff or ""
+                if text:
+                    try:
+                        prog.minhash_signature = minhash_signature(
+                            text,
+                            num_perm=target_num_perm,
+                            shingle_len=shingle_len,
+                        )
+                        updated += 1
+                    except Exception:
+                        # Leave as-is if recompute fails
+                        pass
+                else:
+                    prog.minhash_signature = []
+        if updated:
+            logger.info(
+                f"Normalized MinHash signatures for {updated} programs to num_perm={target_num_perm}"
+            )
 
     def _update_diversity_reference_set(self) -> None:
         """Update the reference set for diversity calculation"""
@@ -2513,6 +2643,8 @@ class ProgramDatabase:
 
     def _get_diff_from_root(self, commit_hash: str):
         """Return (prompt_diff, hash_diff) between root_commit and *commit_hash*.
+
+        root_commit is user-defined starting point of evolution.
 
         Uses `git diff` under the hood and falls back to empty strings if diff fails.
         """
