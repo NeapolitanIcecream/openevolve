@@ -213,6 +213,14 @@ class DatabaseConfig:
     island_diversity_max_comparisons: int = 6
     diversity_cache_size: int = 1000
     feature_scaling_method: str = "minmax"
+    # Diversity reference set maintenance
+    diversity_reference_online_margin: float = 0.05
+    diversity_reference_refresh_by_inserts_enabled: bool = True
+    diversity_reference_refresh_by_time_enabled: bool = False
+    diversity_reference_refresh_by_population_enabled: bool = False
+    diversity_reference_refresh_adds: int = 40
+    diversity_reference_refresh_seconds: float = 300.0
+    diversity_reference_rebuild_remove_ratio: float = 0.1
     # --- Feature statistics (sliding window & robust scaling) ---
     feature_stats_window_size: int = 5000
     feature_stats_recompute_interval: int = 500
@@ -425,6 +433,13 @@ class Config:
                 "island_diversity_max_comparisons": self.database.island_diversity_max_comparisons,
                 "diversity_cache_size": self.database.diversity_cache_size,
                 "feature_scaling_method": self.database.feature_scaling_method,
+                "diversity_reference_online_margin": self.database.diversity_reference_online_margin,
+                "diversity_reference_refresh_by_inserts_enabled": self.database.diversity_reference_refresh_by_inserts_enabled,
+                "diversity_reference_refresh_by_time_enabled": self.database.diversity_reference_refresh_by_time_enabled,
+                "diversity_reference_refresh_by_population_enabled": self.database.diversity_reference_refresh_by_population_enabled,
+                "diversity_reference_refresh_adds": self.database.diversity_reference_refresh_adds,
+                "diversity_reference_refresh_seconds": self.database.diversity_reference_refresh_seconds,
+                "diversity_reference_rebuild_remove_ratio": self.database.diversity_reference_rebuild_remove_ratio,
                 # Feature statistics (sliding window & robust scaling)
                 "feature_stats_window_size": self.database.feature_stats_window_size,
                 "feature_stats_recompute_interval": self.database.feature_stats_recompute_interval,

@@ -182,6 +182,11 @@ class ProgramDatabase:
         self.diversity_cache_size: int = getattr(config, "diversity_cache_size", 1000)
         self.diversity_reference_set: List[List[int]] = []  # Reference signatures
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
+        # Reference set maintenance state
+        self.diversity_reference_program_ids: List[str] = []
+        self._divref_adds_since_build: int = 0
+        self._divref_last_built_at_time: float = time.time()
+        self._divref_sig_len: int = int(getattr(config, "minhash_num_perm", 64))
 
         # Feature scaling infrastructure
         self.feature_stats: Dict[str, FeatureStats] = {}
@@ -410,6 +415,14 @@ class ProgramDatabase:
             self._save_program(program)
 
         logger.debug(f"Added program {program.id} to island {island_idx}")
+
+        # Online/periodic maintenance of diversity reference set (post-write)
+        try:
+            self._consider_candidate_for_reference_set(program)
+            self._divref_adds_since_build += 1
+            self._maybe_refresh_diversity_reference_set()
+        except Exception as e:
+            logger.debug(f"Diversity reference maintenance error: {e}")
 
         return program.id
 
@@ -704,6 +717,12 @@ class ProgramDatabase:
                 self._rebuild_feature_stats_from_programs()
             except Exception as e:
                 logger.warning(f"Failed to rebuild feature stats after load: {e}")
+
+        # Rebuild diversity reference set after load to ensure freshness
+        try:
+            self._refresh_diversity_reference_set_full()
+        except Exception as e:
+            logger.debug(f"Failed to rebuild diversity reference set after load: {e}")
 
     def _reconstruct_islands(self, saved_islands: List[List[str]]) -> None:
         """
@@ -1526,6 +1545,11 @@ class ProgramDatabase:
                 removed_ratio = removed_count / float(original_size)
                 if removed_ratio >= self.feature_stats_rebuild_remove_ratio:
                     self._rebuild_feature_stats_from_programs()
+                    # Optionally trigger diversity reference set rebuild on large removals
+                    if bool(getattr(self.config, "diversity_reference_refresh_by_population_enabled", False)):
+                        pop_ratio = float(getattr(self.config, "diversity_reference_rebuild_remove_ratio", 0.1))
+                        if removed_ratio >= pop_ratio:
+                            self._refresh_diversity_reference_set_full()
         except Exception as e:
             logger.debug(f"Feature stats rebuild check failed: {e}")
 
@@ -1899,12 +1923,20 @@ class ProgramDatabase:
                 shingle_len=getattr(self.config, "minhash_shingle_len", 5),
             )
 
-        # Update reference set if needed
-        if (
+        # Update reference set if needed (prefer full refresh for consistency)
+        need_build = (
             not self.diversity_reference_set
             or len(self.diversity_reference_set) < self.diversity_reference_size
-        ):
-            self._update_diversity_reference_set()
+        )
+        try:
+            sig_len = len(program.minhash_signature) if program.minhash_signature else int(getattr(self.config, "minhash_num_perm", 64))
+        except Exception:
+            sig_len = int(getattr(self.config, "minhash_num_perm", 64))
+        if need_build or sig_len != int(getattr(self, "_divref_sig_len", sig_len)):
+            try:
+                self._refresh_diversity_reference_set_full()
+            except Exception:
+                self._update_diversity_reference_set()
 
         # Compute diversity against reference set
         diversity_scores = []
@@ -1983,6 +2015,187 @@ class ProgramDatabase:
         logger.debug(
             f"Updated diversity reference set with {len(self.diversity_reference_set)} programs"
         )
+
+    # ---------------- Diversity reference set maintenance (online + periodic) ----------------
+    def _consider_candidate_for_reference_set(self, program: Program) -> None:
+        """Online maintenance: consider adding/replacing a candidate into the reference set.
+
+        Uses a farthest-first style heuristic to keep the set diverse.
+        """
+        # Ensure candidate has signature
+        if not program.minhash_signature:
+            text_for_sig = program.hash_diff or program.prompt_diff or ""
+            program.minhash_signature = minhash_signature(
+                text_for_sig,
+                num_perm=getattr(self.config, "minhash_num_perm", 64),
+                shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+            )
+
+        sig = program.minhash_signature
+        if not sig:
+            return
+
+        # If reference set empty or not full, append directly
+        if not self.diversity_reference_set or len(self.diversity_reference_set) < self.diversity_reference_size:
+            self.diversity_reference_set.append(sig)
+            self.diversity_reference_program_ids.append(program.id)
+            # Update bookkeeping
+            self._divref_sig_len = len(sig)
+            if len(self.diversity_reference_set) == self.diversity_reference_size:
+                self._divref_last_built_at_time = time.time()
+            return
+
+        # Signature length mismatch -> trigger a full refresh instead of online replace
+        if len(sig) != self._divref_sig_len:
+            self._refresh_diversity_reference_set_full()
+            return
+
+        # Avoid duplicate ids
+        if program.id in self.diversity_reference_program_ids:
+            return
+
+        # Compute candidate's minimum similarity to current reference set
+        cand_min_sim = 1.0
+        for ref_sig in self.diversity_reference_set:
+            try:
+                s = minhash_similarity(sig, ref_sig)
+            except Exception:
+                s = 1.0
+            if s < cand_min_sim:
+                cand_min_sim = s
+
+        # For each existing member, compute its nearest neighbor similarity within the set
+        # Identify the most redundant member (highest nearest-neighbor similarity)
+        most_redundant_idx = -1
+        most_redundant_nn_sim = -1.0
+        k = len(self.diversity_reference_set)
+        for i in range(k):
+            ref_i = self.diversity_reference_set[i]
+            nn_sim = 1.0
+            for j in range(k):
+                if i == j:
+                    continue
+                try:
+                    s = minhash_similarity(ref_i, self.diversity_reference_set[j])
+                except Exception:
+                    s = 1.0
+                if s < nn_sim:
+                    nn_sim = s
+            # Choose the member with largest nearest-neighbor similarity (closest to others)
+            if nn_sim > most_redundant_nn_sim:
+                most_redundant_nn_sim = nn_sim
+                most_redundant_idx = i
+
+        margin = float(getattr(self.config, "diversity_reference_online_margin", 0.05))
+        # Replace if candidate is notably less similar to the set than the most-redundant member's nearest neighbor
+        if cand_min_sim + margin < most_redundant_nn_sim and 0 <= most_redundant_idx < len(self.diversity_reference_set):
+            self.diversity_reference_set[most_redundant_idx] = sig
+            # Maintain same ordering length in ids list
+            if most_redundant_idx < len(self.diversity_reference_program_ids):
+                self.diversity_reference_program_ids[most_redundant_idx] = program.id
+            else:
+                # Fallback safety
+                self.diversity_reference_program_ids.append(program.id)
+
+    def _prune_diversity_reference_set(self) -> None:
+        """Remove entries whose program ids are stale or signatures invalid."""
+        if not self.diversity_reference_set:
+            return
+        new_sigs: List[List[int]] = []
+        new_ids: List[str] = []
+        for idx, sig in enumerate(self.diversity_reference_set):
+            pid = self.diversity_reference_program_ids[idx] if idx < len(self.diversity_reference_program_ids) else None
+            if pid is None or pid not in self.programs:
+                continue
+            if not isinstance(sig, list) or (self._divref_sig_len and len(sig) != self._divref_sig_len):
+                continue
+            new_sigs.append(sig)
+            new_ids.append(pid)
+        self.diversity_reference_set = new_sigs
+        self.diversity_reference_program_ids = new_ids
+
+    def _should_refresh_diversity_reference_set(self) -> bool:
+        """Check periodic refresh conditions based on config toggles."""
+        now = time.time()
+        # Inserts-based trigger
+        if bool(getattr(self.config, "diversity_reference_refresh_by_inserts_enabled", True)):
+            try:
+                threshold = int(getattr(self.config, "diversity_reference_refresh_adds", 40))
+            except Exception:
+                threshold = 40
+            if self._divref_adds_since_build >= max(1, threshold):
+                return True
+        # Time-based trigger
+        if bool(getattr(self.config, "diversity_reference_refresh_by_time_enabled", False)):
+            try:
+                seconds = float(getattr(self.config, "diversity_reference_refresh_seconds", 300.0))
+            except Exception:
+                seconds = 300.0
+            if now - float(getattr(self, "_divref_last_built_at_time", 0.0)) >= seconds:
+                return True
+        return False
+
+    def _maybe_refresh_diversity_reference_set(self) -> None:
+        if self._should_refresh_diversity_reference_set():
+            self._refresh_diversity_reference_set_full()
+
+    def _refresh_diversity_reference_set_full(self) -> None:
+        """Rebuild the diversity reference set and parallel program id list using a greedy farthest-first strategy."""
+        # If no programs, clear
+        if not self.programs:
+            self.diversity_reference_set = []
+            self.diversity_reference_program_ids = []
+            self._divref_adds_since_build = 0
+            self._divref_last_built_at_time = time.time()
+            return
+
+        all_programs: List[Program] = list(self.programs.values())
+        # Ensure signatures
+        for p in all_programs:
+            if not p.minhash_signature:
+                p.minhash_signature = minhash_signature(
+                    p.hash_diff or p.prompt_diff or "",
+                    num_perm=getattr(self.config, "minhash_num_perm", 64),
+                    shingle_len=getattr(self.config, "minhash_shingle_len", 5),
+                )
+
+        if len(all_programs) <= self.diversity_reference_size:
+            self.diversity_reference_set = [p.minhash_signature for p in all_programs]
+            self.diversity_reference_program_ids = [p.id for p in all_programs]
+        else:
+            remaining = all_programs.copy()
+            # Start with a random program
+            first_idx = self.rng.randint(0, len(remaining) - 1)
+            selected: List[Program] = [remaining.pop(first_idx)]
+            # Greedy farthest-first
+            while len(selected) < self.diversity_reference_size and remaining:
+                best_idx = -1
+                best_min_div = -1.0
+                for i, cand in enumerate(remaining):
+                    # Compute minimum diversity (1 - similarity) vs current selected
+                    min_div = float("inf")
+                    for s in selected:
+                        try:
+                            sim = minhash_similarity(cand.minhash_signature, s.minhash_signature)
+                        except Exception:
+                            sim = 1.0
+                        div = 1.0 - sim
+                        if div < min_div:
+                            min_div = div
+                    if min_div > best_min_div:
+                        best_min_div = min_div
+                        best_idx = i
+                if best_idx >= 0:
+                    selected.append(remaining.pop(best_idx))
+                else:
+                    break
+            self.diversity_reference_set = [p.minhash_signature for p in selected]
+            self.diversity_reference_program_ids = [p.id for p in selected]
+
+        # Update bookkeeping
+        self._divref_sig_len = len(self.diversity_reference_set[0]) if self.diversity_reference_set else int(getattr(self.config, "minhash_num_perm", 64))
+        self._divref_adds_since_build = 0
+        self._divref_last_built_at_time = time.time()
 
     def _rebuild_feature_stats_from_programs(self) -> None:
         """Rebuild feature stats buffers and cache from current programs (read-only scan).
