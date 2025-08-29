@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Set, Tuple, cast, TypedDict, Deque
 from collections import deque
 import math
+import functools
 
 from openevolve.config import DatabaseConfig
 from openevolve.utils.metrics_utils import safe_numeric_average
@@ -235,6 +236,14 @@ class ProgramDatabase:
 
         logger.info(f"Initialized program database with {len(self.programs)} programs")
 
+        # Runtime bookkeeping for scaling freeze and rebin
+        self._total_adds: int = 0
+        self._feature_stats_updates_frozen: bool = False
+        self._feature_stats_cache_prev: Dict[str, Dict[str, float]] = {}
+        self._rebin_due_to_drift: bool = False
+        self._last_rebin_at_adds: int = 0
+        self._last_rebin_at_time: float = time.time()
+
     def add(
         self, program: Program, iteration: Optional[int] = None, target_island: Optional[int] = None
     ) -> str:
@@ -435,6 +444,34 @@ class ProgramDatabase:
 
         logger.debug(f"Added program {program.id} to island {island_idx}")
 
+        # Update counters for freeze/rebin triggers
+        self._total_adds += 1
+        # Freeze feature stats after warmup if enabled
+        if bool(getattr(self.config, "feature_stats_freeze_enabled", False)) and not self._feature_stats_updates_frozen:
+            try:
+                warmup = int(getattr(self.config, "feature_stats_freeze_after_adds", 2000))
+            except Exception:
+                warmup = 2000
+            if self._total_adds >= max(1, warmup):
+                self._feature_stats_updates_frozen = True
+                logger.info("Feature statistics updates frozen after warmup")
+
+        # Periodic rebin triggers based on adds/time
+        if bool(getattr(self.config, "feature_map_rebin_enabled", False)):
+            now = time.time()
+            adds_interval = int(getattr(self.config, "feature_map_rebin_interval_adds", 0) or 0)
+            secs_interval = float(getattr(self.config, "feature_map_rebin_interval_seconds", 0.0) or 0.0)
+            should_by_adds = adds_interval > 0 and (self._total_adds - self._last_rebin_at_adds) >= adds_interval
+            should_by_time = secs_interval > 0.0 and (now - self._last_rebin_at_time) >= secs_interval
+            if should_by_adds or should_by_time or self._rebin_due_to_drift:
+                try:
+                    self._rebin_feature_map(quiet=bool(getattr(self.config, "feature_map_rebin_quiet", True)))
+                except Exception as e:
+                    logger.debug(f"Feature map rebin failed: {e}")
+                self._last_rebin_at_adds = self._total_adds
+                self._last_rebin_at_time = now
+                self._rebin_due_to_drift = False
+
         # Online/periodic maintenance of diversity reference set (post-write)
         try:
             self._consider_candidate_for_reference_set(program)
@@ -508,22 +545,11 @@ class ProgramDatabase:
             )
             if sorted_programs:
                 logger.debug(f"Found best program by metric '{metric}': {sorted_programs[0].id}")
-        elif self.programs and all("combined_score" in p.metrics for p in self.programs.values()):
-            # Sort by combined_score if it exists (preferred method)
-            sorted_programs = sorted(
-                self.programs.values(), key=lambda p: p.metrics["combined_score"], reverse=True
-            )
-            if sorted_programs:
-                logger.debug(f"Found best program by combined_score: {sorted_programs[0].id}")
         else:
-            # Sort by average of all numeric metrics as fallback
-            sorted_programs = sorted(
-                self.programs.values(),
-                key=lambda p: safe_numeric_average(p.metrics),
-                reverse=True,
-            )
+            # Unified fitness ranking
+            sorted_programs = sorted(self.programs.values(), key=self._fitness_value, reverse=True)
             if sorted_programs:
-                logger.debug(f"Found best program by average metrics: {sorted_programs[0].id}")
+                logger.debug(f"Found best program by unified fitness: {sorted_programs[0].id}")
 
         return sorted_programs[0] if sorted_programs else None
 
@@ -571,20 +597,8 @@ class ProgramDatabase:
                 reverse=True,
             )
         else:
-            # Default sorting: prefer combined_score when universally present
-            if candidates and all("combined_score" in p.metrics for p in candidates):
-                sorted_programs = sorted(
-                    candidates,
-                    key=lambda p: p.metrics["combined_score"],
-                    reverse=True,
-                )
-            else:
-                # Fallback to average of all numeric metrics
-                sorted_programs = sorted(
-                    candidates,
-                    key=lambda p: safe_numeric_average(p.metrics),
-                    reverse=True,
-                )
+            # Unified fitness sorting
+            sorted_programs = sorted(candidates, key=self._fitness_value, reverse=True)
 
         return sorted_programs[:n]
 
@@ -864,6 +878,13 @@ class ProgramDatabase:
             logger.info("No island assignments found, distributing programs across islands")
             self._distribute_programs_to_islands()
 
+        # After reconstruction, it's safe to rebin feature map once when enabled
+        if bool(getattr(self.config, "feature_map_rebin_enabled", False)):
+            try:
+                self._rebin_feature_map(quiet=True)
+            except Exception:
+                pass
+
     def _distribute_programs_to_islands(self) -> None:
         """
         Distribute loaded programs across islands when no island metadata exists
@@ -938,7 +959,11 @@ class ProgramDatabase:
                     bin_idx = 0
                 else:
                     diversity = self._get_cached_diversity(program)
-                    bin_idx = self._calculate_diversity_bin(diversity, update_stats=update_stats)
+                    # If program has no diff text, treat diversity as neutral and do NOT update stats
+                    has_text = bool(program.hash_diff or program.prompt_diff)
+                    bin_idx = self._calculate_diversity_bin(
+                        diversity, update_stats=(update_stats and has_text)
+                    )
                 coords.append(bin_idx)
             elif dim == "score":
                 # Use average of numeric metrics
@@ -1080,6 +1105,21 @@ class ProgramDatabase:
 
         return avg1 > avg2
 
+    def _fitness_value(self, program: Program) -> float:
+        """Return a numeric fitness value for unified sorting/ranking.
+
+        Prefer combined_score when present, otherwise average of numeric metrics.
+        Programs with no metrics get -inf to rank them as worst when sorting by fitness.
+        """
+        try:
+            if program.metrics:
+                if "combined_score" in program.metrics:
+                    return float(program.metrics.get("combined_score", float("-inf")))
+                return float(safe_numeric_average(program.metrics))
+        except Exception:
+            pass
+        return float("-inf")
+
     def _update_archive(self, program: Program) -> None:
         """
         Update the archive of elite programs
@@ -1112,17 +1152,9 @@ class ProgramDatabase:
             self.archive.add(program.id)
             return
 
-        # Find worst program among valid programs using the same criterion as _is_better
+        # Find worst program among valid programs using unified fitness comparator
         if valid_archive_programs:
-            worst_program = valid_archive_programs[0]
-            for p in valid_archive_programs[1:]:
-                # If p is better than current worst, keep worst; otherwise update worst to p
-                # i.e., choose the one that is NOT better than many others
-                if self._is_better(worst_program, p):
-                    # worst_program remains
-                    pass
-                else:
-                    worst_program = p
+            worst_program = min(valid_archive_programs, key=self._fitness_value)
 
             # Replace if new program is better than the worst in archive
             if self._is_better(program, worst_program):
@@ -1546,14 +1578,9 @@ class ProgramDatabase:
             f"Population size ({len(self.programs)}) exceeds limit ({self.config.population_size}), removing {num_to_remove} programs"
         )
 
-        # Get programs sorted by fitness (worst first)
+        # Get programs sorted by unified fitness (worst first)
         all_programs = list(self.programs.values())
-
-        # Sort by average metric (worst first)
-        sorted_programs = sorted(
-            all_programs,
-            key=lambda p: safe_numeric_average(p.metrics),
-        )
+        sorted_programs = sorted(all_programs, key=self._fitness_value)
 
         # Remove worst programs, but never remove the best program or excluded program
         programs_to_remove = []
@@ -1995,6 +2022,9 @@ class ProgramDatabase:
             Diversity score (cached or newly computed)
         """
         text_for_key = program.hash_diff or program.prompt_diff or ""
+        # Neutral handling for empty text: return 0.5, no cache updates, no stats updates by caller
+        if not text_for_key:
+            return 0.5
         try:
             code_key = hashlib.sha1(text_for_key.encode("utf-8")).hexdigest()
         except Exception:
@@ -2037,8 +2067,9 @@ class ProgramDatabase:
             sum(diversity_scores) / max(1, len(diversity_scores)) if diversity_scores else 0.0
         )
 
-        # Cache the result with LRU eviction
-        self._cache_diversity_value(code_key, diversity)
+        # Cache the result with LRU eviction (skip caching for empty text which is handled above)
+        if code_key:
+            self._cache_diversity_value(code_key, diversity)
 
         return diversity
 
@@ -2092,6 +2123,7 @@ class ProgramDatabase:
 
         if len(all_programs) <= self.diversity_reference_size:
             sigs = []
+            ids = []
             for p in all_programs:
                 if not p.minhash_signature:
                     p.minhash_signature = minhash_signature(
@@ -2100,7 +2132,9 @@ class ProgramDatabase:
                         shingle_len=getattr(self.config, "minhash_shingle_len", 5),
                     )
                 sigs.append(p.minhash_signature)
+                ids.append(p.id)
             self.diversity_reference_set = sigs
+            self.diversity_reference_program_ids = ids
         else:
             # Select programs with maximum diversity based on MinHash
             selected: List[Program] = []
@@ -2141,6 +2175,7 @@ class ProgramDatabase:
                     selected.append(remaining.pop(best_idx))
 
             self.diversity_reference_set = [p.minhash_signature for p in selected]
+            self.diversity_reference_program_ids = [p.id for p in selected]
 
         logger.debug(
             f"Updated diversity reference set with {len(self.diversity_reference_set)} programs"
@@ -2326,6 +2361,8 @@ class ProgramDatabase:
         self._divref_sig_len = len(self.diversity_reference_set[0]) if self.diversity_reference_set else int(getattr(self.config, "minhash_num_perm", 64))
         self._divref_adds_since_build = 0
         self._divref_last_built_at_time = time.time()
+        # Invalidate diversity cache because reference set changed
+        self._invalidate_diversity_cache()
 
     def _rebuild_feature_stats_from_programs(self) -> None:
         """Rebuild feature stats buffers and cache from current programs (read-only scan).
@@ -2421,6 +2458,10 @@ class ProgramDatabase:
             feature_name: Name of the feature dimension
             value: New value to incorporate into stats
         """
+        # Skip updates if stats are frozen
+        if bool(getattr(self.config, "feature_stats_freeze_enabled", False)) and self._feature_stats_updates_frozen:
+            return
+
         if feature_name not in self.feature_stats:
             self.feature_stats[feature_name] = {
                 "min": value,
@@ -2576,8 +2617,30 @@ class ProgramDatabase:
         if len(buf) < self.feature_stats_min_samples:
             return
         if updates >= self.feature_stats_recompute_interval:
+            # Save previous cache snapshot for drift detection (selected keys)
+            prev = self._feature_stats_cache.get(feature_name, {}).copy()
             self._recompute_feature_stats(feature_name)
             self._feature_updates_since_recompute[feature_name] = 0
+            # If rebin is enabled, detect drift and set flag
+            if bool(getattr(self.config, "feature_map_rebin_enabled", False)):
+                try:
+                    drift_threshold = float(getattr(self.config, "feature_map_rebin_drift_threshold", 0.1))
+                except Exception:
+                    drift_threshold = 0.1
+                curr = self._feature_stats_cache.get(feature_name, {})
+                def _rel_change(old: float, new: float) -> float:
+                    try:
+                        denom = max(1e-9, abs(old))
+                        return abs(new - old) / denom
+                    except Exception:
+                        return 0.0
+                # Use min/max and robust quantiles when available
+                keys = ["min", "max", "q_low", "q_high"]
+                for k in keys:
+                    if k in prev and k in curr:
+                        if _rel_change(float(prev[k]), float(curr[k])) >= drift_threshold:
+                            self._rebin_due_to_drift = True
+                            break
 
     def _recompute_feature_stats(self, feature_name: str) -> None:
         buf = self._feature_value_buffer.get(feature_name)
@@ -2637,7 +2700,48 @@ class ProgramDatabase:
                 f"diversity={stat['diversity']:.2f}, gen={stat['generation']}{best_indicator}"
             )
 
- 
+    def _rebin_feature_map(self, quiet: bool = True) -> None:
+        """Rebuild feature_map and island bests according to current scaling stats.
+
+        This is equivalent to the load-time repair but available at runtime.
+        Does not mutate islands membership, only remaps feature_map occupancy.
+        """
+        # Rebuild feature_map
+        rebuilt_feature_map: Dict[str, str] = {}
+        for prog in self.programs.values():
+            try:
+                coords = self._calculate_feature_coords(prog, update_stats=False)
+            except Exception:
+                continue
+            key = self._feature_coords_to_key(coords)
+            if key not in rebuilt_feature_map:
+                rebuilt_feature_map[key] = prog.id
+            else:
+                existing_id = rebuilt_feature_map[key]
+                if existing_id in self.programs:
+                    if self._is_better(prog, self.programs[existing_id]):
+                        rebuilt_feature_map[key] = prog.id
+                else:
+                    rebuilt_feature_map[key] = prog.id
+        self.feature_map = rebuilt_feature_map
+
+        # Recalculate island best programs coherently using _is_better()
+        new_island_bests: List[Optional[str]] = [None] * len(self.islands)
+        for i, island in enumerate(self.islands):
+            best_id: Optional[str] = None
+            for pid in island:
+                if pid not in self.programs:
+                    continue
+                if best_id is None:
+                    best_id = pid
+                else:
+                    if self._is_better(self.programs[pid], self.programs[best_id]):
+                        best_id = pid
+            new_island_bests[i] = best_id
+        self.island_best_programs = new_island_bests
+
+        if not quiet:
+            logger.info("Feature map rebin completed. Occupied cells: %d", len(self.feature_map))
 
     # ---------------- Git helpers ----------------
 

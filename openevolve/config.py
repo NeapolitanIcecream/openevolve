@@ -236,6 +236,20 @@ class DatabaseConfig:
     # Trigger a rebuild of feature stats when a single cleanup removes ≥ this fraction of population
     feature_stats_rebuild_remove_ratio: float = 0.1
 
+    # --- Feature statistics stability & MAP-Elites rebin controls ---
+    # A) Freeze scaling after warmup
+    feature_stats_freeze_enabled: bool = False
+    feature_stats_freeze_after_adds: int = 2000
+    # B) Low-frequency full rebin options
+    feature_map_rebin_enabled: bool = False
+    # Relative change threshold for stats drift to trigger rebin (e.g., 0.1 == 10%)
+    feature_map_rebin_drift_threshold: float = 0.1
+    # Periodic rebin triggers (0 disables that trigger)
+    feature_map_rebin_interval_adds: int = 0
+    feature_map_rebin_interval_seconds: float = 0.0
+    # Quiet logging during rebin
+    feature_map_rebin_quiet: bool = True
+
     # MinHash signature settings
     minhash_num_perm: int = 64
     minhash_shingle_len: int = 5
@@ -450,6 +464,14 @@ class Config:
                 "feature_readonly_fallback_mode": self.database.feature_readonly_fallback_mode,
                 "feature_readonly_static_minmax": self.database.feature_readonly_static_minmax,
                 "feature_stats_rebuild_remove_ratio": self.database.feature_stats_rebuild_remove_ratio,
+                # Feature statistics stability & MAP-Elites rebin controls
+                "feature_stats_freeze_enabled": self.database.feature_stats_freeze_enabled,
+                "feature_stats_freeze_after_adds": self.database.feature_stats_freeze_after_adds,
+                "feature_map_rebin_enabled": self.database.feature_map_rebin_enabled,
+                "feature_map_rebin_drift_threshold": self.database.feature_map_rebin_drift_threshold,
+                "feature_map_rebin_interval_adds": self.database.feature_map_rebin_interval_adds,
+                "feature_map_rebin_interval_seconds": self.database.feature_map_rebin_interval_seconds,
+                "feature_map_rebin_quiet": self.database.feature_map_rebin_quiet,
                 "minhash_num_perm": self.database.minhash_num_perm,
                 "minhash_shingle_len": self.database.minhash_shingle_len,
                 "commit_message_template": self.database.commit_message_template,
