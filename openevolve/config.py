@@ -436,6 +436,7 @@ class Config:
                 "git_user_email": self.database.git_user_email,
                 "feature_dimensions": self.database.feature_dimensions,
                 "feature_bins": self.database.feature_bins,
+                "diversity_reference_size": self.database.diversity_reference_size,
                 "migration_interval": self.database.migration_interval,
                 "migration_rate": self.database.migration_rate,
                 "random_seed": self.database.random_seed,

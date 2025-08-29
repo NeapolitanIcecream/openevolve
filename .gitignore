@@ -56,3 +56,4 @@ problems
 
 # For Cursor
 .cursor/
+.tmp/
