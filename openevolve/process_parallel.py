@@ -269,15 +269,25 @@ def _run_iteration_worker(
         
         parent = programs[parent_id]
         
-        # Build exact-dedup keys from snapshot (SHA1 over normalized diffs)
+        # Build exact-dedup keys from snapshot for CURRENT ISLAND only
         dedup_keys: set[str] = set()
-        for p in programs.values():
-            text = (p.hash_diff or p.prompt_diff or "")
-            if text:
-                try:
-                    dedup_keys.add(hashlib.sha1(text.encode("utf-8")).hexdigest())
-                except Exception:
-                    pass
+        try:
+            islands: List[List[str]] = cast(List[List[str]], db_snapshot.get("islands", []))
+            current_island_idx: int = int(cast(int, db_snapshot.get("current_island", 0)))
+            island_member_ids = set(islands[current_island_idx]) if 0 <= current_island_idx < len(islands) else set()
+            for pid in island_member_ids:
+                p = programs.get(pid)
+                if not p:
+                    continue
+                text = (p.hash_diff or p.prompt_diff or "")
+                if text:
+                    try:
+                        dedup_keys.add(hashlib.sha1(text.encode("utf-8")).hexdigest())
+                    except Exception:
+                        pass
+        except Exception:
+            # Fallback to empty set if snapshot malformed
+            dedup_keys = set()
 
         # Start timer
         iteration_start = time.time()

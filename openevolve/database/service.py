@@ -115,6 +115,9 @@ class ProgramDatabase:
             program.iteration_found = iteration
             self.last_iteration = max(self.last_iteration, iteration)
 
+        # Resolve target island early for island-scoped deduplication
+        island_idx = (target_island if target_island is not None else self._islands.current_island) % len(self._islands.islands)
+
         # Possibly compute diffs -> signatures
         if not program.hash_diff and program.commit_hash:
             try:
@@ -128,31 +131,37 @@ class ProgramDatabase:
         if program.hash_diff and not program.minhash_signature:
             self.diversity.ensure_signature(program)
 
-        # Exact dedup skip
-        if not bool(program.metadata.get("cloned_for_empty_island", False)):
-            if self.dedup.is_duplicate(program):
-                existing_id = self.dedup.find_program_id(program)
-                if existing_id:
-                    return existing_id
-                # Fallback: linear scan to find canonical program id and update mapping
+        # Exact dedup within island
+        if self.dedup.is_duplicate(program, island_idx):
+            existing_id = self.dedup.find_program_id(program, island_idx)
+            if existing_id:
+                return existing_id
+            # Fallback: linear scan within the island to find canonical program id and update mapping
+            try:
+                key = self.dedup.equivalence_key(program)
+            except Exception:
+                key = None
+            if key:
                 try:
-                    key = self.dedup.equivalence_key(program)
+                    island_member_ids = list(self._islands.islands[island_idx])
+                    for pid in island_member_ids:
+                        if pid not in self.repo.programs:
+                            continue
+                        _p = self.repo.programs[pid]
+                        try:
+                            if self.dedup.equivalence_key(_p) == key:
+                                # update canonical mapping for future queries (island-scoped)
+                                try:
+                                    self.dedup.key_to_program_id_by_island.setdefault(island_idx, {})[key] = _p.id
+                                except Exception:
+                                    pass
+                                return _p.id
+                        except Exception:
+                            continue
                 except Exception:
-                    key = None
-                if key:
-                    try:
-                        for _p in self.repo.programs.values():
-                            try:
-                                if self.dedup.equivalence_key(_p) == key:
-                                    # update canonical mapping for future queries
-                                    self.dedup.key_to_program_id[key] = _p.id
-                                    return _p.id
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-                # As a last resort, block insertion and return the provided id (legacy parity)
-                return program.id
+                    pass
+            # As a last resort, block insertion and return the provided id (legacy parity)
+            return program.id
 
         # Insert
         self.repo.put(program)
@@ -165,7 +174,6 @@ class ProgramDatabase:
             self.archive.archive.add(program.id)
 
         # Island membership
-        island_idx = (target_island if target_island is not None else self._islands.current_island) % len(self._islands.islands)
         self._islands.add_to_island(program.id, island_idx)
         program.metadata["island"] = island_idx
 
@@ -187,8 +195,8 @@ class ProgramDatabase:
         self.archive.update_best_program(program, self.repo.programs, self.feature_map)
         self.archive.update_island_best(program, island_idx, self.repo.programs, self.feature_map)
 
-        # Register dedup key
-        self.dedup.register(program)
+        # Register dedup key (island-scoped)
+        self.dedup.register(program, island_idx)
 
         # Persistence
         if self.repo.persistence_enabled and self.config.db_path:
@@ -295,8 +303,8 @@ class ProgramDatabase:
             "current_island": self._islands.current_island,
             "island_generations": self._islands.island_generations,
             "last_migration_generation": self._islands.last_migration_generation,
-            # Persist all seen keys to maintain blocking semantics across restarts
-            "seen_equiv_keys": self.dedup.export_seen_keys(),
+            # Persist per-island seen keys to maintain island-scoped blocking across restarts
+            "island_seen_equiv_keys": self.dedup.export_seen_keys_by_island(),
         }
         import json
         with open(os.path.join(save_path, "metadata.json"), "w") as f:
@@ -323,15 +331,15 @@ class ProgramDatabase:
             self._islands.current_island = metadata.get("current_island", 0)
             self._islands.island_generations = metadata.get("island_generations", [0] * len(saved_islands))
             self._islands.last_migration_generation = metadata.get("last_migration_generation", 0)
-            keys = metadata.get("seen_equiv_keys", [])
-            if isinstance(keys, list):
-                # Preload seen keys to immediately block duplicates; canonical map rebuilt later
-                self.dedup.preload_seen_keys(keys)
+            keys_by_island = metadata.get("island_seen_equiv_keys", {})
+            if isinstance(keys_by_island, dict):
+                # Preload per-island seen keys to immediately block duplicates; canonical map rebuilt later
+                self.dedup.preload_seen_keys_by_island(keys_by_island)
         self.repo.load_all(path)
         # reconstruct islands
         self._reconstruct_islands(saved_islands)
-        # rebuild dedup mapping from programs
-        self.dedup.rebuild_from_programs(self.repo.programs)
+        # rebuild dedup mapping from programs using island memberships
+        self.dedup.rebuild_from_programs(self.repo.programs, self._islands.islands)
         # rebuild feature stats & minhash norms & diversity reference
         if self.repo.programs:
             self.scaler.rebuild_feature_stats_from_programs(list(self.repo.programs.values()), self.config.feature_dimensions)
