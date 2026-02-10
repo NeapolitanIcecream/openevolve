@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **This project has been rewritten from scratch.**
+>
+> To address fundamental architectural and algorithmic design issues, I have completely rebuilt this project. You are likely looking for the new version here:
+>
+> 👉 **https://github.com/NeapolitanIcecream/loreley**
+
 # OpenEvolve
 
 Commit-based evolutionary coding agent: a practical, end-to-end system for evolving entire codebases inside a Git repository using LLMs, MAP-Elites and an island model, and process-based parallelism.
